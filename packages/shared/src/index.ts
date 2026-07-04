@@ -1,3 +1,4 @@
+export * from "./atomic-write";
 export * from "./ipc";
 export * from "./schema";
 export * from "./bus";
