@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import net from "node:net";
-import type { Context } from "grammy";
+import type { Api, Context } from "grammy";
 import type { CreatePollerOptions, Poller } from "@mirza-harness/telegram-adapter";
 import { defaultAccess } from "@mirza-harness/shared";
 import { startHostd, type HostdHandle } from "../src/main";
@@ -8,6 +8,7 @@ import { setAccess } from "../src/state/access-store";
 import { claimNext } from "../src/bus/bus";
 import type { HostdConfig } from "../src/config";
 import type { HolderHandle, SpawnHolderFn } from "../src/supervisor/supervisor";
+import type { SessionOps } from "../src/supervisor/session-ops";
 
 /**
  * Task D2, Fase 1 — smoke test for the production assembly (`startHostd`).
@@ -74,6 +75,58 @@ const fakeSpawnHolder: SpawnHolderFn = (): HolderHandle => ({
   on() {},
 });
 const SUPERVISOR_TEST_OPTS = { spawnHolder: fakeSpawnHolder, enableLegacyPendingShim: false } as const;
+
+/**
+ * Task E1' assembly tests — a fake grammy `Api` (records every `sendMessage`/
+ * `editMessageText` call instead of a real HTTPS call). Overriding
+ * `createApi` this way means these tests exercise the REAL meta-command
+ * (M1) and /context+/version (M2) send paths end-to-end without any network
+ * access, unlike the existing tests above which carefully avoid ever
+ * reaching `Api.sendMessage` at all.
+ */
+interface FakeApiCall {
+  kind: "sendMessage" | "editMessageText";
+  chatId: string;
+  text: string;
+  other?: unknown;
+}
+function fakeApi(calls: FakeApiCall[]): Api {
+  return {
+    sendMessage: async (chat_id: string, text: string, other?: unknown) => {
+      calls.push({ kind: "sendMessage", chatId: String(chat_id), text, other });
+      return { message_id: 1 };
+    },
+    editMessageText: async (chat_id: string, _message_id: number, text: string, other?: unknown) => {
+      calls.push({ kind: "editMessageText", chatId: String(chat_id), text, other });
+      return true;
+    },
+  } as unknown as Api;
+}
+
+/**
+ * Fake `SessionOps` (session-ops.ts) — every method is a spy-friendly stub.
+ * Required for any test exercising `/new /switch /delete /rename /effort`:
+ * the real `createSessionOps` awaits a genuine injection ack via
+ * `supervisor.queue` (up to `clearAckTimeoutMs`, ~135s default), which
+ * `fakeSpawnHolder` (never a real pty-holder — see `SUPERVISOR_TEST_OPTS`'s
+ * doc) never fires, so a test using the real implementation would hang.
+ */
+function fakeSessionOps(overrides: Partial<SessionOps> = {}): SessionOps {
+  return {
+    listSessions: () => [],
+    currentSession: () => null,
+    isAlive: () => true,
+    resume: () => ({ ok: true }),
+    rename: async () => ({ ok: true, from: "idle", to: "renamed" }),
+    clearSession: async () => ({ ok: true, nameApplied: true }),
+    setEffort: () => ({ ok: true }),
+    archiveSession: () => ({ ok: true }),
+    hardDelete: () => ({ ok: true }),
+    bulkArchive: () => ({ processed: 0, skipped: 0, errors: 0 }),
+    bulkDelete: () => ({ processed: 0, skipped: 0, errors: 0 }),
+    ...overrides,
+  };
+}
 
 describe("startHostd — smoke", () => {
   let handle: HostdHandle | undefined;
@@ -328,5 +381,202 @@ describe("startHostd — smoke", () => {
     expect(closeReceived).toBe(true);
 
     handle = undefined; // already shut down — afterEach shouldn't shut down again
+  });
+});
+
+/**
+ * Task E1' (Fase 2 assembly) — proves the wiring main.ts adds on top of the
+ * D2/C4/S1 smoke tests above: metaCommands (M1) reaches session-ops (S2),
+ * /context (M2) is answered directly after SEC-1's gate, and the ackCallback
+ * fix (E1-1 regression) labels a successful meta: tap correctly. Uses the
+ * same `fakeSpawnHolder`/`fakeCreatePoller` conventions as the smoke suite
+ * above, plus `createApi`/`sessionOps` (both test-only seams added in this
+ * task) so NEITHER a real Telegram HTTP call NOR session-ops's real
+ * injection-ack polling ever runs in this suite.
+ */
+describe("startHostd — Task E1' assembly (meta-commands, /context, ackCallback fix)", () => {
+  let handle: HostdHandle | undefined;
+  afterEach(async () => {
+    await handle?.shutdown();
+    handle = undefined;
+  });
+
+  test("Task M1: an allowlisted sender's '/new foo' reaches SessionOps.clearSession via the metaCommands adaptor, and its meta-executed reply is sent (not delivered to the AI)", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-meta-new-${process.pid}`;
+
+    const clearSessionCalls: Array<{ bot: unknown; opts: unknown }> = [];
+    const sessionOps = fakeSessionOps({
+      clearSession: async (bot, opts) => {
+        clearSessionCalls.push({ bot, opts });
+        return { ok: true, nameApplied: true };
+      },
+    });
+    const apiCalls: FakeApiCall[] = [];
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
+      createPoller: fakeCreatePoller(captured),
+      createApi: () => fakeApi(apiCalls),
+      sessionOps,
+    });
+
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: ["999"] }, "telegram");
+
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "tester" },
+      message: { message_id: 1, text: "/new foo", date: Math.floor(Date.now() / 1000) },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    // The metaCommands adaptor (session-ops-client.ts) called SessionOps.clearSession —
+    // NOT the bus (no envelope should have been enqueued for the AI).
+    expect(clearSessionCalls).toEqual([{ bot: { id: "bot-smoke", workspace: "C:/ws/bot-smoke" }, opts: { name: "foo" } }]);
+    expect(claimNext(handle.db, "bot-smoke")).toBeNull();
+
+    // The meta-executed result was sent as a brand-new message via the raw Api
+    // (not OutboundSender's ai:*-prefixed buttons path — this message has no buttons anyway).
+    expect(apiCalls).toEqual([{ kind: "sendMessage", chatId: "999", text: '🧹 New session started as "foo".', other: undefined }]);
+  });
+
+  test("Task M2: an allowlisted sender's '/context' is answered directly after SEC-1's gate, never delivered to the AI", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-context-${process.pid}`;
+    const apiCalls: FakeApiCall[] = [];
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
+      createPoller: fakeCreatePoller(captured),
+      createApi: () => fakeApi(apiCalls),
+      sessionOps: fakeSessionOps(),
+    });
+
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: ["999"] }, "telegram");
+
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "tester" },
+      message: { message_id: 1, text: "/context", date: Math.floor(Date.now() / 1000) },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    // buildContextReply(botId, sessionQuery) ran (SessionQuery read the real,
+    // empty `sessions` table for bot-smoke) and rendered the "no data yet"
+    // fallback (context-command.ts's renderContextReply(null)) — proof it was
+    // actually invoked, past SEC-1's gate, rather than silently dropped.
+    expect(apiCalls).toEqual([{ kind: "sendMessage", chatId: "999", text: "(no data yet)", other: {} }]);
+    // Never delivered to the AI as a plain message.
+    expect(claimNext(handle.db, "bot-smoke")).toBeNull();
+  });
+
+  test("Task M2 + SEC-1: a NON-allowlisted sender's '/context' is dropped by gate() — never answered, never delivered", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-context-drop-${process.pid}`;
+    const apiCalls: FakeApiCall[] = [];
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
+      createPoller: fakeCreatePoller(captured),
+      createApi: () => fakeApi(apiCalls),
+      sessionOps: fakeSessionOps(),
+    });
+
+    // NOT allowlisted + dmPolicy 'allowlist' (default) -> gate() drops (SEC-1: no leniency for info commands).
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: [], dmPolicy: "allowlist" }, "telegram");
+
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "stranger" },
+      message: { message_id: 1, text: "/context", date: Math.floor(Date.now() / 1000) },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    expect(apiCalls).toEqual([]);
+    expect(claimNext(handle.db, "bot-smoke")).toBeNull();
+  });
+
+  test("E1' fix: an authorized meta: callback tap (e.g. 'meta:cancel') acks with its OWN text, never the generic 'Not authorized.'", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-meta-cb-${process.pid}`;
+    const apiCalls: FakeApiCall[] = [];
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
+      createPoller: fakeCreatePoller(captured),
+      createApi: () => fakeApi(apiCalls),
+      sessionOps: fakeSessionOps(),
+    });
+
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: ["999"] }, "telegram");
+
+    const answerCalls: unknown[] = [];
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "tester" },
+      callbackQuery: {
+        data: "meta:cancel",
+        message: { message_id: 1, date: Math.floor(Date.now() / 1000), reply_markup: { inline_keyboard: [] } },
+      },
+      answerCallbackQuery: async (arg?: unknown) => {
+        answerCalls.push(arg);
+      },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    // meta-commands.ts's "cancel" branch: [{kind:'ack',text:'Cancelled'}, {kind:'edit',...}].
+    expect(answerCalls).toEqual([{ text: "Cancelled" }]);
+    expect(answerCalls).not.toContainEqual({ text: "Not authorized." });
+  });
+
+  test("E1' fix: an UNAUTHORIZED ai:* callback tap is still acked with 'Not authorized.' (dropped outcome unchanged)", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-cb-unauth-e1prime-${process.pid}`;
+    const apiCalls: FakeApiCall[] = [];
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
+      createPoller: fakeCreatePoller(captured),
+      createApi: () => fakeApi(apiCalls),
+      sessionOps: fakeSessionOps(),
+    });
+
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: [], dmPolicy: "allowlist" }, "telegram");
+
+    const answerCalls: unknown[] = [];
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "stranger" },
+      callbackQuery: {
+        data: "ai:yes",
+        message: { message_id: 1, date: Math.floor(Date.now() / 1000), reply_markup: { inline_keyboard: [] } },
+      },
+      answerCallbackQuery: async (arg?: unknown) => {
+        answerCalls.push(arg);
+      },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    expect(answerCalls).toEqual([{ text: "Not authorized." }]);
   });
 });
