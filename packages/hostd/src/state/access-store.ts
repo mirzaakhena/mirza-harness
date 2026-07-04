@@ -1,6 +1,11 @@
 import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { z } from "zod";
+import {
+  AccessSchema,
+  PENDING_CAP,
+  defaultAccess,
+  type Access,
+} from "@mirza-harness/shared";
 
 /**
  * Port dari `plugins/telegram/server.ts` (mirza-marketplace) — type `Access`
@@ -10,58 +15,22 @@ import { z } from "zod";
  * mutasi lewat API di bawah, jadi akar SCAR-021 (race antar penulis file)
  * hilang untuk state access.
  *
+ * Skema (`AccessSchema`, `Access`, `PENDING_CAP`, `defaultAccess`) dipindah ke
+ * `@mirza-harness/shared` (Task C2, Fase 1) supaya jadi satu sumber yang
+ * dipakai bareng `telegram-adapter` (gate/pairing) tanpa telegram-adapter
+ * depend ke hostd. Re-export di sini supaya pemanggil existing (test, dst.)
+ * tidak perlu ganti path impor.
+ *
  * Field, default, dan urutan validasi persis meniru `Access` lama supaya
  * `importLegacyAccessJson` bisa membaca access.json apa adanya.
  */
 
-const DEFAULT_CHANNEL = "telegram";
+export { AccessSchema, PENDING_CAP, defaultAccess, type Access };
 
-/** Cap pending pairing per bot — nilai ini ikut kode acuan (`server.ts`: "Cap pending at 3"). */
-export const PENDING_CAP = 3;
+const DEFAULT_CHANNEL = "telegram";
 
 /** TTL kode pairing — ikut kode acuan (1 jam). */
 const PENDING_TTL_MS = 60 * 60 * 1000;
-
-export const PendingEntrySchema = z
-  .object({
-    senderId: z.string(),
-    chatId: z.string(),
-    createdAt: z.number(),
-    expiresAt: z.number(),
-    replies: z.number(),
-  })
-  .strict();
-
-export const GroupPolicySchema = z
-  .object({
-    requireMention: z.boolean(),
-    allowFrom: z.array(z.string()),
-  })
-  .strict();
-
-export const AccessSchema = z
-  .object({
-    dmPolicy: z.enum(["pairing", "allowlist", "disabled"]).default("pairing"),
-    allowFrom: z.array(z.string()).default([]),
-    groups: z.record(GroupPolicySchema).default({}),
-    pending: z.record(PendingEntrySchema).default({}),
-    // delivery/UX config — optional, sama seperti kode acuan
-    mentionPatterns: z.array(z.string()).optional(),
-    ackReaction: z.string().optional(),
-    replyToMode: z.enum(["off", "first", "all"]).optional(),
-    textChunkLimit: z.number().optional(),
-    chunkMode: z.enum(["length", "newline"]).optional(),
-  })
-  .strict();
-
-export type PendingEntry = z.infer<typeof PendingEntrySchema>;
-export type GroupPolicy = z.infer<typeof GroupPolicySchema>;
-export type Access = z.infer<typeof AccessSchema>;
-
-/** Hasil `{}` lewat AccessSchema — dipakai saat baris (channel,bot_id) belum ada. */
-export function defaultAccess(): Access {
-  return AccessSchema.parse({});
-}
 
 function loadRow(db: Database, botId: string, channel: string): Access {
   const row = db
