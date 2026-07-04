@@ -3,5 +3,18 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" }
+  "engines": { "node": ">=18" },
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "start": "node --import tsx src/main.ts",
+    "test:integration": "node --import tsx test-integration.mjs"
+  },
+  "dependencies": {
+    "@mirza-harness/shared": "workspace:*",
+    "node-pty": "^1.1.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
 }
