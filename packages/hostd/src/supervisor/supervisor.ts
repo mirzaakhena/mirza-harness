@@ -206,6 +206,22 @@ export function spawnRealHolder(bot: BotConfig, opts: SpawnHolderOptions = {}): 
 
 export type SpawnHolderFn = (bot: BotConfig, opts?: SpawnHolderOptions) => HolderHandle;
 
+/**
+ * Task S2, Fase 2 (SCAR-035) — `/effort`'s confirm picker needs its second
+ * `\r` timed at exactly 500ms after the first (recon-meta.md §C, PTY-059).
+ * `guardSlashCommand` (injection.ts) already restricts `/effort` to
+ * `source: 'supervisor'` — session-ops.ts's `setEffort` is the only caller.
+ * The delay itself is threaded here (rather than added as a field on
+ * `BatchSubItem`/`InjectItem` in injection.ts) because it is a fixed
+ * constant tied to the command word, not a genuine per-call parameter; doing
+ * it here keeps injection.ts (S1, already committed) untouched.
+ */
+export const EFFORT_CONFIRM_AFTER_MS = 500;
+
+function effortConfirmAfterMs(payload: string): number | undefined {
+  return /^\/effort(\s|$)/.test(payload) ? EFFORT_CONFIRM_AFTER_MS : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // BotSupervisor
 // ---------------------------------------------------------------------------
@@ -359,7 +375,7 @@ export class BotSupervisor {
 
   private dispatchToHolder(stepId: string, unit: BatchSubItem): void {
     if (!this.holder) return; // shouldn't happen (poll loop gates on holder presence) — defensive no-op
-    if (unit.kind === "slash") this.holder.injectSlash(stepId, unit.payload);
+    if (unit.kind === "slash") this.holder.injectSlash(stepId, unit.payload, effortConfirmAfterMs(unit.payload));
     else this.holder.inject(stepId, unit.payload, true);
   }
 

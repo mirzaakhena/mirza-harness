@@ -84,7 +84,7 @@ type ListenerMap = {
 };
 
 class FakeHolder implements HolderHandle {
-  readonly injectCalls: Array<{ stepId: string; command: string; kind: "slash" | "text" }> = [];
+  readonly injectCalls: Array<{ stepId: string; command: string; kind: "slash" | "text"; confirmAfterMs?: number }> = [];
   shutdownBehavior: "resolve" | "hang" | "reject" = "resolve";
   forceKillCalled = false;
   /** I2 fix: last signal `forceKill` was invoked with, so tests can assert the SIGTERM->SIGKILL escalation. */
@@ -94,8 +94,8 @@ class FakeHolder implements HolderHandle {
   inject(stepId: string, text: string): void {
     this.injectCalls.push({ stepId, command: text, kind: "text" });
   }
-  injectSlash(stepId: string, command: string): void {
-    this.injectCalls.push({ stepId, command, kind: "slash" });
+  injectSlash(stepId: string, command: string, confirmAfterMs?: number): void {
+    this.injectCalls.push({ stepId, command, kind: "slash", confirmAfterMs });
   }
   shutdown(): Promise<void> {
     if (this.shutdownBehavior === "resolve") return Promise.resolve();
@@ -204,6 +204,24 @@ describe("BotSupervisor — spawn + status", () => {
     holder.emitInjected(holder.injectCalls[0]!.stepId);
     expect(supervisor.status().queue).toBe(0);
     expect(supervisor.status().last_ack_s).toBe(0);
+  });
+
+  test("SCAR-035: /effort dispatched with source:'supervisor' carries confirmAfterMs=500; other commands carry none", () => {
+    const { supervisor, instances, clock } = makeSupervisor();
+    supervisor.start();
+    const r = supervisor.enqueueSlash("/effort high", "supervisor");
+    expect(r.ok).toBe(true);
+    clock.advance(200);
+    const holder = instances[0]!;
+    expect(holder.injectCalls[0]!.command).toBe("/effort high");
+    expect(holder.injectCalls[0]!.confirmAfterMs).toBe(500);
+
+    holder.emitInjected(holder.injectCalls[0]!.stepId);
+    clock.advance(2_000); // clear the post-injection gate hold
+    supervisor.enqueueSlash("/status");
+    clock.advance(200);
+    expect(holder.injectCalls[1]!.command).toBe("/status");
+    expect(holder.injectCalls[1]!.confirmAfterMs).toBeUndefined();
   });
 
   test("enqueueSlash rejects an invalid/blocked command without touching the holder", () => {

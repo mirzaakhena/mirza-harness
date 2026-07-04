@@ -108,6 +108,21 @@ CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- Task S2, Fase 2 — soft-delete marker for session-ops' listSessions/archive
+-- flow. Port of plugins/telegram/archive-store.ts's archived-sessions.json
+-- (mirza-marketplace) to a table, per that task's brief ("port archive-store
+-- ke tabel atau file setara"). session_id here may reference a jsonl-only
+-- session that never got a \`sessions\` row (pre-migration history) — no FK
+-- to sessions(id) on purpose. Archiving never touches the jsonl file on disk
+-- (matches the ported source's "unarchiving is intentionally not exposed"
+-- semantics) or (row 'hard delete') removes it here too.
+CREATE TABLE IF NOT EXISTS session_archive (
+  bot_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  archived_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (bot_id, session_id)
+);
 `;
 
 export function applySchema(db: Database): void {
