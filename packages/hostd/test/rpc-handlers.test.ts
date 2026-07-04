@@ -7,6 +7,7 @@ import {
   handleAgentList,
   handleAgentStatus,
   handleAgentSend,
+  handleSessionStarted,
   type RpcHandlerDeps,
 } from "../src/rpc-handlers";
 import type { OutboundSender } from "@mirza-harness/telegram-adapter";
@@ -175,5 +176,105 @@ describe("handleAgentSend", () => {
     expect(() =>
       handleAgentSend({ from: "bot-01", target: "bot-02", payload: { kind: "prompt", body: "hi", hop_count: 6 } }, deps),
     ).toThrow();
+  });
+});
+
+describe("handleSessionStarted", () => {
+  test("brand-new session_id -> row inserted, lifecycle+name default 'idle', additionalContext reflects it", () => {
+    const deps = baseDeps({ now: () => 5000 });
+
+    const result = handleSessionStarted({ bot_id: "bot-01", session_id: "sess-new", source: "startup", cwd: "C:/workspace/bot-01" }, deps);
+
+    expect(result).toEqual({ additionalContext: 'Current session name: "idle"' });
+    const row = deps.db.query(`SELECT id, bot_id, name, lifecycle, started_at FROM sessions WHERE id = ?`).get("sess-new");
+    expect(row).toEqual({ id: "sess-new", bot_id: "bot-01", name: "idle", lifecycle: "idle", started_at: 5 });
+  });
+
+  test("resolves the bot via cwd->workspace mapping, not the hook's self-reported bot_id", () => {
+    const deps = baseDeps();
+    // bot_id claimed is bot-02, but cwd matches bot-01's workspace — workspace mapping wins.
+    const result = handleSessionStarted({ bot_id: "bot-02", session_id: "sess-x", source: "startup", cwd: "C:/workspace/bot-01" }, deps);
+    expect(result).toEqual({ additionalContext: 'Current session name: "idle"' });
+    const row = deps.db.query(`SELECT bot_id FROM sessions WHERE id = ?`).get("sess-x") as { bot_id: string };
+    expect(row.bot_id).toBe("bot-01");
+  });
+
+  test("cwd doesn't match any workspace -> falls back to bot_id match", () => {
+    const deps = baseDeps();
+    const result = handleSessionStarted({ bot_id: "bot-02", session_id: "sess-y", source: "startup", cwd: "C:/somewhere/else" }, deps);
+    expect(result).toEqual({ additionalContext: 'Current session name: "idle"' });
+    const row = deps.db.query(`SELECT bot_id FROM sessions WHERE id = ?`).get("sess-y") as { bot_id: string };
+    expect(row.bot_id).toBe("bot-02");
+  });
+
+  test("neither cwd nor bot_id resolve to a known bot -> clear error, nothing written", () => {
+    const deps = baseDeps();
+    expect(() =>
+      handleSessionStarted({ bot_id: "ghost-bot", session_id: "sess-z", source: "startup", cwd: "C:/nowhere" }, deps),
+    ).toThrow(/tidak cocok workspace bot manapun/);
+    expect(deps.db.query(`SELECT * FROM sessions WHERE id = ?`).get("sess-z")).toBeNull();
+  });
+
+  test("no `bots` row pre-populated (production reality today) -> FK satisfied by handler's own upsert, not a crash", () => {
+    const deps = baseDeps();
+    expect(deps.db.query(`SELECT * FROM bots WHERE id = ?`).get("bot-01")).toBeNull();
+    expect(() =>
+      handleSessionStarted({ bot_id: "bot-01", session_id: "sess-fk", source: "startup", cwd: "C:/workspace/bot-01" }, deps),
+    ).not.toThrow();
+    expect(deps.db.query(`SELECT * FROM bots WHERE id = ?`).get("bot-01")).not.toBeNull();
+  });
+
+  test("existing session_id previously marked 'resetting' with a custom name -> lifecycle flips to 'idle', name/started_at preserved (fix M4)", () => {
+    const deps = baseDeps();
+    deps.db.run(`INSERT INTO bots (id, workspace) VALUES (?, ?)`, ["bot-01", "C:/workspace/bot-01"]);
+    deps.db.run(`INSERT INTO sessions (id, bot_id, name, lifecycle, started_at) VALUES (?, ?, ?, ?, ?)`, [
+      "sess-resume",
+      "bot-01",
+      "my-renamed-session",
+      "resetting",
+      1000,
+    ]);
+
+    const result = handleSessionStarted({ bot_id: "bot-01", session_id: "sess-resume", source: "clear", cwd: "C:/workspace/bot-01" }, deps);
+
+    expect(result).toEqual({ additionalContext: 'Current session name: "my-renamed-session"' });
+    const row = deps.db.query(`SELECT name, lifecycle, started_at FROM sessions WHERE id = ?`).get("sess-resume");
+    expect(row).toEqual({ name: "my-renamed-session", lifecycle: "idle", started_at: 1000 });
+  });
+
+  test("releases the resolved bot's supervisor barrier via onSessionStarted() (fake supervisor)", () => {
+    let released = 0;
+    const supervisors = new Map([["bot-01", { onSessionStarted: () => { released += 1; } }]]);
+    const deps = baseDeps({ supervisors });
+
+    handleSessionStarted({ bot_id: "bot-01", session_id: "sess-barrier", source: "startup", cwd: "C:/workspace/bot-01" }, deps);
+
+    expect(released).toBe(1);
+  });
+
+  test("only the resolved bot's supervisor is released, not another bot's", () => {
+    const released: string[] = [];
+    const supervisors = new Map([
+      ["bot-01", { onSessionStarted: () => released.push("bot-01") }],
+      ["bot-02", { onSessionStarted: () => released.push("bot-02") }],
+    ]);
+    const deps = baseDeps({ supervisors });
+
+    handleSessionStarted({ bot_id: "bot-02", session_id: "sess-barrier-2", source: "startup", cwd: "C:/workspace/bot-02" }, deps);
+
+    expect(released).toEqual(["bot-02"]);
+  });
+
+  test("no `supervisors` dep wired -> barrier release silently no-ops (row still written, reply still returned)", () => {
+    const deps = baseDeps();
+    expect(() =>
+      handleSessionStarted({ bot_id: "bot-01", session_id: "sess-no-supervisor", source: "startup", cwd: "C:/workspace/bot-01" }, deps),
+    ).not.toThrow();
+    expect(deps.db.query(`SELECT * FROM sessions WHERE id = ?`).get("sess-no-supervisor")).not.toBeNull();
+  });
+
+  test("bad params shape (missing session_id) -> zod error, nothing written", () => {
+    const deps = baseDeps();
+    expect(() => handleSessionStarted({ bot_id: "bot-01", source: "startup", cwd: "C:/workspace/bot-01" }, deps)).toThrow();
   });
 });

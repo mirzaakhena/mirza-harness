@@ -2,7 +2,14 @@ import net from "node:net";
 import { z } from "zod";
 import { RpcRequest, ChannelConfirmParams, type RpcEventT, parseRpcMessage } from "@mirza-harness/shared";
 import { doctorReport } from "./doctor";
-import { handleTelegramOutbound, handleAgentList, handleAgentStatus, handleAgentSend, type RpcHandlerDeps } from "./rpc-handlers";
+import {
+  handleTelegramOutbound,
+  handleAgentList,
+  handleAgentStatus,
+  handleAgentSend,
+  handleSessionStarted,
+  type RpcHandlerDeps,
+} from "./rpc-handlers";
 
 type Handler = (params: unknown, sock: net.Socket) => unknown | Promise<unknown>;
 
@@ -91,6 +98,8 @@ const handlers: Record<string, Handler> = {
   "agent.list": params => handleAgentList(params, requireRpcDeps()),
   "agent.status": params => handleAgentStatus(params, requireRpcDeps()),
   "agent.send": params => handleAgentSend(params, requireRpcDeps()),
+  // Task H1, Fase 2 — cc-stub's SessionStart hook (`packages/cc-stub/hooks/session-start.ts`).
+  "session.started": params => handleSessionStarted(params, requireRpcDeps()),
 };
 
 /** Apakah bot_id punya koneksi cc-stub terdaftar saat ini. */

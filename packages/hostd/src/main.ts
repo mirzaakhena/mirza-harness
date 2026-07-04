@@ -290,6 +290,10 @@ export async function startHostd(opts: StartHostdOptions = {}): Promise<HostdHan
     isRegistered,
     deliveryStats: () => delivery.stats(),
     supervisorStatuses: () => supervisors.statuses(),
+    // H1: SessionStart hook -> session.started handler releases the /clear
+    // barrier via supervisor.onSessionStarted(). Without this the handler
+    // degrades to the 120s InjectionQueue barrier-timeout fallback.
+    supervisors: supervisors.supervisors,
   });
 
   let shuttingDown = false;
