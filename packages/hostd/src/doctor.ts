@@ -18,6 +18,16 @@ export interface DoctorPollerStatusLike {
   state: string;
 }
 
+/** Structural subset of `supervisor.ts`'s `SupervisorStatus` — same "avoid a hard type import" rationale as `DoctorPollerStatusLike`. */
+export interface DoctorSupervisorStatusLike {
+  holder: string;
+  queue: number;
+  awaiting_barrier: boolean;
+  last_ack_s: number | null;
+  restarts: number;
+  barrier_alarm: boolean;
+}
+
 export interface DoctorDeps {
   /** Bila ada, komponen `bus` dilaporkan dari busStats(db) alih-alih "stub". */
   db?: Database;
@@ -33,6 +43,12 @@ export interface DoctorDeps {
    * berpengaruh tanpa `db` (komponen bus tetap "stub").
    */
   deliveryStats?: DeliveryStats;
+  /**
+   * Task S1, Fase 2 — bila ada, komponen `supervisors` dilaporkan sbg
+   * `{botId: SupervisorStatus}` (dari `startSupervisors(...).statuses()`)
+   * alih-alih "stub".
+   */
+  supervisorStatuses?: Readonly<Record<string, DoctorSupervisorStatusLike>>;
 }
 
 /**
@@ -64,12 +80,14 @@ export function doctorReport(deps: DoctorDeps = {}): DoctorReport {
     adaptersComponent = JSON.stringify(byBot);
   }
 
+  const supervisorsComponent = deps.supervisorStatuses ? JSON.stringify(deps.supervisorStatuses) : "stub";
+
   return {
     ok: true,
     version: HOSTD_VERSION,
     pid: process.pid,
     uptime_s: Math.floor(process.uptime()),
     db: deps.db ? "connected" : "not-connected (menyusul fase 1)",
-    components: { bus: busComponent, state: "stub", adapters: adaptersComponent, supervisors: "stub" },
+    components: { bus: busComponent, state: "stub", adapters: adaptersComponent, supervisors: supervisorsComponent },
   };
 }

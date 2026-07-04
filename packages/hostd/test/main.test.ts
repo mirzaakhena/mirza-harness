@@ -7,6 +7,7 @@ import { startHostd, type HostdHandle } from "../src/main";
 import { setAccess } from "../src/state/access-store";
 import { claimNext } from "../src/bus/bus";
 import type { HostdConfig } from "../src/config";
+import type { HolderHandle, SpawnHolderFn } from "../src/supervisor/supervisor";
 
 /**
  * Task D2, Fase 1 — smoke test for the production assembly (`startHostd`).
@@ -56,6 +57,24 @@ function fakeCreatePoller(captured: { onInbound?: (ctx: Context) => void | Promi
   };
 }
 
+/**
+ * Task S1, Fase 2 — these smoke tests exercise the D2/C4 wiring, not the
+ * supervisor; `startHostd` now always spawns a `BotSupervisor` per bot, so a
+ * fake `spawnHolder` (never a real `node --import tsx pty-holder` child) is
+ * REQUIRED here per the S1 brief's "test JANGAN spawn holder Node
+ * sungguhan". `enableLegacyPendingShim: false` keeps these tests from also
+ * standing up a real fs.watch/sweep loop against `state/bot-smoke/pending`
+ * — that shim gets its own coverage in pending-consumer.test.ts.
+ */
+const fakeSpawnHolder: SpawnHolderFn = (): HolderHandle => ({
+  inject() {},
+  injectSlash() {},
+  shutdown: () => Promise.resolve(),
+  forceKill() {},
+  on() {},
+});
+const SUPERVISOR_TEST_OPTS = { spawnHolder: fakeSpawnHolder, enableLegacyPendingShim: false } as const;
+
 describe("startHostd — smoke", () => {
   let handle: HostdHandle | undefined;
   afterEach(async () => {
@@ -71,6 +90,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: fakeCreatePoller(captured),
     });
 
@@ -102,6 +122,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: fakeCreatePoller(captured),
     });
 
@@ -131,6 +152,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: fakeCreatePoller(captured),
     });
 
@@ -165,6 +187,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: fakeCreatePoller(captured),
     });
 
@@ -197,6 +220,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: fakeCreatePoller(captured),
     });
 
@@ -230,6 +254,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: (options: CreatePollerOptions): Poller => {
         captured.onInbound = options.onInbound;
         return {
@@ -257,6 +282,7 @@ describe("startHostd — smoke", () => {
       config: makeFakeConfig(),
       dbPath: ":memory:",
       pipeName: pipe,
+      ...SUPERVISOR_TEST_OPTS,
       createPoller: fakeCreatePoller(captured),
     });
 

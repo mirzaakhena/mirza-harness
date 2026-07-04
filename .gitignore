@@ -5,4 +5,4 @@ node_modules/
 dist/
 .superpowers/
 hostd.config.json
-state/
+/state/

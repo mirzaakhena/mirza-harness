@@ -7,6 +7,7 @@ import type { HostdConfig } from "./config";
 import { enqueue } from "./bus/bus";
 import { composeAgentPrompt } from "./bus/marker";
 import type { DeliveryStats } from "./bus/delivery";
+import type { DoctorSupervisorStatusLike } from "./doctor";
 
 /**
  * Task D2, Fase 1 — hostd's side of the cc-stub tools proxy: `server.ts`
@@ -47,6 +48,13 @@ export interface RpcHandlerDeps {
    * Optional so tests exercising the 4 handlers above don't need to supply it.
    */
   deliveryStats?: () => DeliveryStats;
+  /**
+   * Task S1, Fase 2 — same carry-through pattern as `deliveryStats`: not
+   * used by the 4 RPC handlers below, exists so `main.ts` can register one
+   * deps object that ALSO feeds `server.ts`'s `doctor` handler with real
+   * per-bot supervisor status (`startSupervisors(...).statuses()`).
+   */
+  supervisorStatuses?: () => Readonly<Record<string, DoctorSupervisorStatusLike>>;
 }
 
 function nowMs(deps: RpcHandlerDeps): number {

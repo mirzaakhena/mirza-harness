@@ -14,6 +14,8 @@ import { startDelivery, confirmDelivery, type DeliveryHandle } from "./bus/deliv
 import { startTelegramAdapters, type TelegramAdapterDeps, type TelegramAdaptersHandle } from "./adapters/telegram";
 import { mapCtxToInboundMessage } from "./adapters/ctx-map";
 import { startServer, pushEvent, isRegistered, registerConfirmHandler, registerRpcHandlerDeps, destroyAllConnections } from "./server";
+import { startSupervisors, type SpawnHolderFn, type SupervisorsHandle } from "./supervisor/supervisor";
+import { startPendingConsumer, type PendingConsumerHandle } from "./shim/pending-consumer";
 
 /**
  * Task D2, Fase 1 — production assembly: wires every module built across
@@ -126,6 +128,20 @@ function botStateDir(bot: BotConfig): string {
   return join(process.cwd(), "state", bot.id);
 }
 
+/**
+ * Task S1, Fase 2 — where THIS pilot bot watches for a bot-lama's legacy
+ * `pending/*.json` mailbox (Task X2's `pending-consumer.ts`; recon-hooks.md
+ * §D "hostd KONSUMSI selama fase 2"). No config field exists for "the old
+ * wrapper's state dir" (that belongs to a DIFFERENT process/repo entirely),
+ * so this reuses the same per-bot state area hostd already owns
+ * (`botStateDir`) rather than inventing a new config knob for a mixed-fleet
+ * window — documented assumption, revisit if a real migration needs the
+ * dir to be independently configurable.
+ */
+function botPendingDir(bot: BotConfig): string {
+  return join(botStateDir(bot), "pending");
+}
+
 export interface StartHostdOptions {
   /** Default: `loadConfig()` (reads MIRZA_HOSTD_CONFIG / ./hostd.config.json). Test-injectable to skip the filesystem entirely. */
   config?: HostdConfig;
@@ -140,6 +156,19 @@ export interface StartHostdOptions {
    * long-poll against Telegram.
    */
   createPoller?: TelegramAdapterDeps["createPoller"];
+  /**
+   * Task S1, Fase 2 — test-injectable holder factory (mock pty-holder — see
+   * `supervisor.ts`'s own "test JANGAN spawn holder Node sungguhan"
+   * constraint). Default: `spawnRealHolder` (spawns a real
+   * `node --import tsx pty-holder/src/main.ts` child per bot).
+   */
+  spawnHolder?: SpawnHolderFn;
+  /**
+   * Task S1, Fase 2 — disable the X2 pending-consumer shim (default: on for
+   * every configured bot). Tests that don't want real fs.watch/sweep timers
+   * running against `state/<bot>/pending` can set this `false`.
+   */
+  enableLegacyPendingShim?: boolean;
 }
 
 export interface HostdHandle {
@@ -150,7 +179,8 @@ export interface HostdHandle {
   adapters: TelegramAdaptersHandle;
   delivery: DeliveryHandle;
   telegramSenders: ReadonlyMap<string, OutboundSender>;
-  /** Stop everything (adapters, delivery, unwire server delegates, close the pipe server + db). Idempotent. */
+  supervisors: SupervisorsHandle;
+  /** Stop everything (adapters, delivery, supervisors, pending shims, unwire server delegates, close the pipe server + db). Idempotent. */
   shutdown(): Promise<void>;
 }
 
@@ -229,6 +259,29 @@ export async function startHostd(opts: StartHostdOptions = {}): Promise<HostdHan
     ...(opts.createPoller ? { createPoller: opts.createPoller } : {}),
   });
 
+  // Task S1, Fase 2 — one BotSupervisor (holder spawn/restart/backoff +
+  // injection queue) per configured bot.
+  const supervisors = startSupervisors(config, db, { spawnHolder: opts.spawnHolder });
+
+  // X2 shim: watch each bot's legacy pending/*.json mailbox and forward
+  // command/batch payloads into that bot's own injection queue
+  // (recon-hooks.md §D — "hostd KONSUMSI selama fase 2").
+  const pendingConsumers: PendingConsumerHandle[] = [];
+  if (opts.enableLegacyPendingShim !== false) {
+    for (const bot of config.bots) {
+      const supervisor = supervisors.supervisors.get(bot.id);
+      if (!supervisor) continue; // unreachable — startSupervisors mirrors config.bots 1:1
+      pendingConsumers.push(
+        startPendingConsumer({
+          dir: botPendingDir(bot),
+          botId: bot.id,
+          enqueueEnv: env => enqueue(db, env),
+          enqueueInject: req => supervisor.enqueueFromLegacy(req),
+        }),
+      );
+    }
+  }
+
   registerRpcHandlerDeps({
     db,
     config,
@@ -236,12 +289,15 @@ export async function startHostd(opts: StartHostdOptions = {}): Promise<HostdHan
     adapterStatuses: adapters.statuses,
     isRegistered,
     deliveryStats: () => delivery.stats(),
+    supervisorStatuses: () => supervisors.statuses(),
   });
 
   let shuttingDown = false;
   async function shutdown(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    for (const consumer of pendingConsumers) consumer.stop();
+    await supervisors.stopAll();
     delivery.stop();
     await adapters.stopAll();
     registerConfirmHandler(null);
@@ -271,7 +327,7 @@ export async function startHostd(opts: StartHostdOptions = {}): Promise<HostdHan
     db.close();
   }
 
-  return { db, server, pipe, config, adapters, delivery, telegramSenders, shutdown };
+  return { db, server, pipe, config, adapters, delivery, telegramSenders, supervisors, shutdown };
 }
 
 async function main(): Promise<void> {

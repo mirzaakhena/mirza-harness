@@ -78,3 +78,21 @@ describe("doctorReport (Task D2 — adapterStatuses + deliveryStats wiring)", ()
     expect(r.components.adapters).toBe("stub");
   });
 });
+
+describe("doctorReport (Task S1 — supervisorStatuses wiring)", () => {
+  test("supervisorStatuses -> komponen supervisors berisi {botId: SupervisorStatus}, bukan 'stub'", () => {
+    const r = doctorReport({
+      supervisorStatuses: {
+        "bot-01": { holder: "running", queue: 2, awaiting_barrier: false, last_ack_s: 3, restarts: 0, barrier_alarm: false },
+      },
+    });
+    expect(JSON.parse(r.components.supervisors)).toEqual({
+      "bot-01": { holder: "running", queue: 2, awaiting_barrier: false, last_ack_s: 3, restarts: 0, barrier_alarm: false },
+    });
+  });
+
+  test("tanpa deps sama sekali, supervisors tetap 'stub' (backward-compat)", () => {
+    const r = doctorReport();
+    expect(r.components.supervisors).toBe("stub");
+  });
+});

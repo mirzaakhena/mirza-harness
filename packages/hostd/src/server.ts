@@ -58,7 +58,12 @@ const handlers: Record<string, Handler> = {
   doctor: () =>
     doctorReport(
       rpcDeps
-        ? { db: rpcDeps.db, adapterStatuses: rpcDeps.adapterStatuses, deliveryStats: rpcDeps.deliveryStats?.() }
+        ? {
+            db: rpcDeps.db,
+            adapterStatuses: rpcDeps.adapterStatuses,
+            deliveryStats: rpcDeps.deliveryStats?.(),
+            supervisorStatuses: rpcDeps.supervisorStatuses?.(),
+          }
         : {},
     ),
   "session.register": (params, sock) => {

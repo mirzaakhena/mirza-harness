@@ -45,6 +45,13 @@ const BotConfigSchema = z
         }),
       ),
     workspace: z.string().min(1, "bots[].workspace tidak boleh kosong"),
+    /**
+     * Task S1, Fase 2 — override per-bot untuk pty-holder's `CLAUDE_BIN`/
+     * `CLAUDE_ARGS` env (lihat `packages/pty-holder/README.md` "Env vars").
+     * Opsional: absen -> pty-holder pakai default bawaannya sendiri.
+     */
+    claude_bin: z.string().min(1).optional(),
+    claude_args: z.string().optional(),
   })
   .strict();
 
