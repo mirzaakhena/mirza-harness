@@ -6,3 +6,4 @@ export * from "./outbound-command";
 export * from "./channel";
 export * from "./json-schema";
 export * from "./rpc";
+export * from "./legacy-pending";
