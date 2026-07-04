@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import net from "node:net";
-import { startServer, pushEvent, isRegistered } from "../src/server";
+import { startServer, pushEvent, isRegistered, registerConfirmHandler } from "../src/server";
 
 const TEST_PIPE = `\\\\.\\pipe\\mirza-hostd-test-${process.pid}`;
 
@@ -121,6 +121,58 @@ describe("session.register + pushEvent roundtrip", () => {
 
   test("session.register tanpa bot_id → error terlihat, bukan ditelan", async () => {
     const res = await rpcCall(REGISTER_PIPE, { jsonrpc: "2.0", id: 3, method: "session.register", params: {} });
+    expect(res.error).toBeDefined();
+  });
+});
+
+describe("channel.confirm — delegasi ke delivery", () => {
+  const CONFIRM_PIPE = `\\\\.\\pipe\\mirza-hostd-test-confirm-${process.pid}`;
+  let server: net.Server;
+  afterAll(() => {
+    server?.close();
+    registerConfirmHandler(null); // jangan bocor ke test file lain di proses yang sama
+  });
+
+  test("tanpa delegate ter-wiring → error terlihat, bukan diam-diam sukses", async () => {
+    server = await startServer(CONFIRM_PIPE);
+    const res = await rpcCall(CONFIRM_PIPE, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "channel.confirm",
+      params: { envelope_id: "env-1", attempt_token: "token-1" },
+    });
+    expect(res.error).toBeDefined();
+  });
+
+  test("dgn delegate ter-wiring → dipanggil dgn envelope_id + attempt_token, hasilnya diteruskan sbg result", async () => {
+    const captured: { envelopeId: string | null; attemptToken: string | null } = { envelopeId: null, attemptToken: null };
+    registerConfirmHandler((envelopeId, attemptToken) => {
+      captured.envelopeId = envelopeId;
+      captured.attemptToken = attemptToken;
+      return { confirmed: true, envelopeId };
+    });
+
+    const res = await rpcCall(CONFIRM_PIPE, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "channel.confirm",
+      params: { envelope_id: "env-42", attempt_token: "token-42" },
+    });
+
+    expect(captured.envelopeId).toBe("env-42");
+    expect(captured.attemptToken).toBe("token-42");
+    expect(res.result).toEqual({ confirmed: true, envelopeId: "env-42" });
+  });
+
+  test("envelope_id kosong/hilang → error validasi, bukan crash", async () => {
+    registerConfirmHandler(() => ({ confirmed: true }));
+    const res = await rpcCall(CONFIRM_PIPE, { jsonrpc: "2.0", id: 3, method: "channel.confirm", params: { attempt_token: "token-3" } });
+    expect(res.error).toBeDefined();
+  });
+
+  test("attempt_token kosong/hilang → error validasi, bukan crash", async () => {
+    registerConfirmHandler(() => ({ confirmed: true }));
+    const res = await rpcCall(CONFIRM_PIPE, { jsonrpc: "2.0", id: 4, method: "channel.confirm", params: { envelope_id: "env-1" } });
     expect(res.error).toBeDefined();
   });
 });

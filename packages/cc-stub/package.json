@@ -3,5 +3,12 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" }
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "start": "bun run src/server.ts"
+  },
+  "dependencies": {
+    "@mirza-harness/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
 }

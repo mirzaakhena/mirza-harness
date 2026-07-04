@@ -1,0 +1,14 @@
+{
+  "name": "cc-stub",
+  "description": "Mirza harness channel stub — meneruskan notifikasi channel dari hostd (Telegram, dst.) ke Claude Code lewat MCP. Tanpa business logic (thin passthrough); balasan/tools ditambahkan di fase berikutnya.",
+  "version": "0.0.1",
+  "author": {
+    "name": "Mirza"
+  },
+  "keywords": [
+    "mirza-harness",
+    "channel",
+    "mcp",
+    "custom"
+  ]
+}

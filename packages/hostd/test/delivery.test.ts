@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { openDb } from "../src/state/db";
 import { enqueue, claimNext } from "../src/bus/bus";
-import { deliverOnce, startDelivery, type DeliveryDeps } from "../src/bus/delivery";
+import { deliverOnce, startDelivery, confirmDelivery, type DeliveryDeps } from "../src/bus/delivery";
 import type { EnvelopeT } from "@mirza-harness/shared";
 
 function env(overrides: Partial<EnvelopeT> = {}): EnvelopeT {
@@ -23,6 +23,11 @@ interface PushedCall {
   params: unknown;
 }
 
+/** Ambil `attempt_token` dari params channel.deliver yang ditangkap fakeDeps. */
+function attemptTokenOf(call: PushedCall): string {
+  return (call.params as { attempt_token: string }).attempt_token;
+}
+
 function fakeDeps(overrides: Partial<DeliveryDeps> = {}): { deps: DeliveryDeps; pushed: PushedCall[] } {
   const pushed: PushedCall[] = [];
   const deps: DeliveryDeps = {
@@ -37,7 +42,7 @@ function fakeDeps(overrides: Partial<DeliveryDeps> = {}): { deps: DeliveryDeps; 
 }
 
 describe("deliverOnce — sukses", () => {
-  test("envelope valid + stub online -> push terpanggil lalu ack", () => {
+  test("envelope valid + stub online -> push terpanggil, in-flight sampai channel.confirm", () => {
     const db = openDb(":memory:");
     const e = env();
     enqueue(db, e);
@@ -50,11 +55,23 @@ describe("deliverOnce — sukses", () => {
     expect(pushed.length).toBe(1);
     expect(pushed[0].botId).toBe(e.to);
     expect(pushed[0].method).toBe("channel.deliver");
-    expect(pushed[0].params).toEqual({ content: "halo dari telegram", meta: { channel: "telegram", chat_id: "123" } });
+    expect(pushed[0].params).toEqual({
+      envelope_id: e.id,
+      attempt_token: expect.any(String),
+      content: "halo dari telegram",
+      meta: { channel: "telegram", chat_id: "123" },
+    });
 
-    // sudah acked -> tak lagi diklaim
+    // push berhasil BUKAN berarti ack lagi (protokol confirm) — masih in-flight,
+    // dan tak lagi claimable selagi menunggu confirm.
     expect(claimNext(db, e.to)).toBeNull();
-    const row = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number };
+    let row = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number | null };
+    expect(row.acked_at).toBeNull();
+
+    // channel.confirm datang -> baru di-ack di sini.
+    const confirmed = confirmDelivery(db, e.id, attemptTokenOf(pushed[0]));
+    expect(confirmed).toBe(true);
+    row = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number };
     expect(row.acked_at).toBeGreaterThan(0);
     db.close();
   });
@@ -116,6 +133,12 @@ describe("deliverOnce — stub offline lalu retry", () => {
     const stats3 = deliverOnce(db, deps);
     expect(stats3.delivered).toBe(1);
     expect(pushed.length).toBe(1);
+
+    // in-flight setelah push sukses — belum ack sampai confirm datang.
+    const rowInFlight = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number | null };
+    expect(rowInFlight.acked_at).toBeNull();
+
+    expect(confirmDelivery(db, e.id, attemptTokenOf(pushed[0]))).toBe(true);
     const rowAfterAck = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number };
     expect(rowAfterAck.acked_at).toBeGreaterThan(0);
     db.close();
@@ -187,7 +210,7 @@ describe("deliverOnce — meta non-string (SCAR-056)", () => {
 });
 
 describe("deliverOnce — urutan FIFO", () => {
-  test("dua envelope utk bot yang sama dikirim ter-tua (ts) lebih dulu, keduanya ke-ack dalam satu tick", () => {
+  test("dua envelope utk bot yang sama dikirim ter-tua (ts) lebih dulu, keduanya di-push dalam satu tick", () => {
     const db = openDb(":memory:");
     const now = Math.floor(Date.now() / 1000);
     const older = env({ ts: now - 100, payload: { content: "pertama", meta: {} } });
@@ -200,8 +223,8 @@ describe("deliverOnce — urutan FIFO", () => {
 
     expect(stats.delivered).toBe(2);
     expect(pushed.length).toBe(2);
-    expect(pushed[0].params).toEqual({ content: "pertama", meta: {} });
-    expect(pushed[1].params).toEqual({ content: "kedua", meta: {} });
+    expect(pushed[0].params).toEqual({ envelope_id: older.id, attempt_token: expect.any(String), content: "pertama", meta: {} });
+    expect(pushed[1].params).toEqual({ envelope_id: newer.id, attempt_token: expect.any(String), content: "kedua", meta: {} });
     db.close();
   });
 
@@ -216,6 +239,115 @@ describe("deliverOnce — urutan FIFO", () => {
     deliverOnce(db, deps);
 
     expect(pushed.map(p => p.botId).sort()).toEqual(["cc-stub-a", "cc-stub-b"]);
+    db.close();
+  });
+});
+
+describe("protokol confirm — in-flight, timeout, retry", () => {
+  test("push sukses tapi channel.confirm tak pernah datang -> timeout -> fail (retry terjadwal), tak pernah ack", async () => {
+    const db = openDb(":memory:");
+    const e = env();
+    enqueue(db, e);
+    const { deps, pushed } = fakeDeps();
+
+    const stats = deliverOnce(db, deps, { confirmTimeoutMs: 20 });
+    expect(stats.delivered).toBe(1);
+    expect(pushed.length).toBe(1);
+
+    const rowBeforeTimeout = db.query("SELECT acked_at, attempts FROM bus_queue WHERE id = ?").get(e.id) as {
+      acked_at: number | null;
+      attempts: number;
+    };
+    expect(rowBeforeTimeout.acked_at).toBeNull();
+    expect(rowBeforeTimeout.attempts).toBe(0);
+
+    // lewati timeout confirm
+    await new Promise(resolve => setTimeout(resolve, 80));
+
+    const rowAfterTimeout = db.query("SELECT acked_at, attempts, next_attempt_at FROM bus_queue WHERE id = ?").get(e.id) as {
+      acked_at: number | null;
+      attempts: number;
+      next_attempt_at: number;
+    };
+    expect(rowAfterTimeout.acked_at).toBeNull();
+    expect(rowAfterTimeout.attempts).toBe(1);
+    expect(rowAfterTimeout.next_attempt_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+
+    // confirm telat (setelah timeout) -> tak berpengaruh, entry in-flight sudah dibuang oleh timeout
+    expect(confirmDelivery(db, e.id, attemptTokenOf(pushed[0]))).toBe(false);
+    db.close();
+  });
+
+  test("channel.confirm datang sebelum timeout -> ack, timeout yang terjadwal tak lagi memicu fail susulan", async () => {
+    const db = openDb(":memory:");
+    const e = env();
+    enqueue(db, e);
+    const { deps, pushed } = fakeDeps();
+
+    deliverOnce(db, deps, { confirmTimeoutMs: 50 });
+    expect(confirmDelivery(db, e.id, attemptTokenOf(pushed[0]))).toBe(true);
+
+    // lewati window timeout yang SEHARUSNYA sudah dibatalkan oleh confirmDelivery
+    await new Promise(resolve => setTimeout(resolve, 90));
+
+    const row = db.query("SELECT acked_at, attempts FROM bus_queue WHERE id = ?").get(e.id) as {
+      acked_at: number;
+      attempts: number;
+    };
+    expect(row.acked_at).toBeGreaterThan(0);
+    expect(row.attempts).toBe(0);
+    db.close();
+  });
+
+  test("confirmDelivery utk envelope_id tak dikenal -> false, tak melempar", () => {
+    const db = openDb(":memory:");
+    expect(confirmDelivery(db, "envelope-tak-ada", "token-tak-relevan")).toBe(false);
+    db.close();
+  });
+
+  test("stale confirm lintas attempt: confirm attempt#1 (telat, post-timeout) TIDAK boleh meng-ack attempt#2 yang in-flight", async () => {
+    const db = openDb(":memory:");
+    const e = env();
+    enqueue(db, e);
+    const { deps, pushed } = fakeDeps();
+
+    // Attempt#1: push, lalu biarkan timeout (tanpa confirm) -> fail + retry terjadwal.
+    const stats1 = deliverOnce(db, deps, { confirmTimeoutMs: 20 });
+    expect(stats1.delivered).toBe(1);
+    expect(pushed.length).toBe(1);
+    const token1 = attemptTokenOf(pushed[0]);
+
+    await new Promise(resolve => setTimeout(resolve, 80)); // lewati timeout confirm attempt#1
+
+    const rowAfterTimeout = db.query("SELECT acked_at, attempts, next_attempt_at FROM bus_queue WHERE id = ?").get(e.id) as {
+      acked_at: number | null;
+      attempts: number;
+      next_attempt_at: number;
+    };
+    expect(rowAfterTimeout.acked_at).toBeNull();
+    expect(rowAfterTimeout.attempts).toBe(1);
+
+    // Paksa next_attempt_at ke masa lalu supaya attempt#2 bisa segera diklaim (simulasi waktu retry tiba).
+    const past = Math.floor(Date.now() / 1000) - 1;
+    db.run("UPDATE bus_queue SET next_attempt_at = ? WHERE id = ?", [past, e.id]);
+
+    // Attempt#2: requeue -> push lagi, in-flight dgn token BARU.
+    const stats2 = deliverOnce(db, deps, { confirmTimeoutMs: 20_000 });
+    expect(stats2.delivered).toBe(1);
+    expect(pushed.length).toBe(2);
+    const token2 = attemptTokenOf(pushed[1]);
+    expect(token2).not.toBe(token1);
+
+    // Confirm telat dari attempt#1 tiba SEKARANG (setelah attempt#2 sudah in-flight) -> HARUS ditolak (stale),
+    // dan TIDAK boleh meng-ack attempt#2 yang belum benar-benar dikonfirmasi.
+    expect(confirmDelivery(db, e.id, token1)).toBe(false);
+    const rowAfterStaleConfirm = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number | null };
+    expect(rowAfterStaleConfirm.acked_at).toBeNull();
+
+    // Confirm yang benar (token attempt#2) -> ack sukses.
+    expect(confirmDelivery(db, e.id, token2)).toBe(true);
+    const rowAfterRealConfirm = db.query("SELECT acked_at FROM bus_queue WHERE id = ?").get(e.id) as { acked_at: number };
+    expect(rowAfterRealConfirm.acked_at).toBeGreaterThan(0);
     db.close();
   });
 });

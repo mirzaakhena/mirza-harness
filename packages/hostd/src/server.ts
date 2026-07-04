@@ -1,9 +1,26 @@
 import net from "node:net";
 import { z } from "zod";
-import { RpcRequest, type RpcEventT, parseRpcMessage } from "@mirza-harness/shared";
+import { RpcRequest, ChannelConfirmParams, type RpcEventT, parseRpcMessage } from "@mirza-harness/shared";
 import { doctorReport } from "./doctor";
 
 type Handler = (params: unknown, sock: net.Socket) => unknown;
+
+/** Delegate yang dipanggil saat method `channel.confirm {envelope_id, attempt_token}` diterima. */
+export type ConfirmDelegate = (envelopeId: string, attemptToken: string) => unknown;
+
+/**
+ * Registry delegate confirm — di-inject dari wiring hostd (mis. main.ts)
+ * yang punya akses ke db + `confirmDelivery` (hostd/bus/delivery.ts).
+ * server.ts sengaja tetap tipis: tidak tahu apa-apa soal db/bus_queue,
+ * hanya mendelegasikan. `null` (belum ter-wiring) -> method
+ * `channel.confirm` menjawab error terlihat, bukan diam-diam sukses.
+ */
+let confirmDelegate: ConfirmDelegate | null = null;
+
+/** Daftarkan (atau lepas dgn `null`) delegate `channel.confirm`. Registrasi baru menimpa yang lama. */
+export function registerConfirmHandler(delegate: ConfirmDelegate | null): void {
+  confirmDelegate = delegate;
+}
 
 /**
  * Registry koneksi cc-stub: bot_id -> socket IPC yang mendaftar via
@@ -26,6 +43,14 @@ const handlers: Record<string, Handler> = {
       if (connections.get(bot_id) === sock) connections.delete(bot_id);
     });
     return { registered: true, bot_id };
+  },
+  "channel.confirm": params => {
+    const { envelope_id, attempt_token } = ChannelConfirmParams.parse(params);
+    if (!confirmDelegate) {
+      // Kegagalan harus terlihat (prinsip §2.5): tanpa wiring, jangan diam2 "sukses".
+      throw new Error("channel.confirm: belum ter-wiring (registerConfirmHandler belum dipanggil)");
+    }
+    return confirmDelegate(envelope_id, attempt_token);
   },
 };
 
