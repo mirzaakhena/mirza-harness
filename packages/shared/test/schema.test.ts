@@ -17,11 +17,12 @@ describe("skema sqlite (draft fase 0)", () => {
     for (const t of EXPECTED_TABLES) expect(names).toContain(t);
   });
 
-  test("FTS5 messages_fts tersedia", () => {
+  test("FTS5 messages_fts tersedia dan tersinkron otomatis via trigger", () => {
     const db = new Database(":memory:");
     applySchema(db);
+    // Tidak ada insert manual ke messages_fts — trigger AFTER INSERT pada
+    // `messages` yang menjaga sinkronisasi (external content table).
     db.run("INSERT INTO messages (bot_id, channel, chat_id, direction, ts, body) VALUES ('bot-03','telegram','1','in',0,'halo dunia')");
-    db.run("INSERT INTO messages_fts(rowid, body) SELECT id, body FROM messages");
     const hit = db.query("SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'halo'").all();
     expect(hit.length).toBe(1);
   });

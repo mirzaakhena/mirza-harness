@@ -30,12 +30,30 @@ CREATE TABLE IF NOT EXISTS messages (
   message_id TEXT,
   direction TEXT NOT NULL,            -- in|out
   source TEXT,                        -- user|assistant|system
+  user_id TEXT,
+  user_name TEXT,
   ts INTEGER NOT NULL,
   body TEXT NOT NULL,
-  meta TEXT                           -- JSON string (album, buttons, quote, ...)
+  attachments TEXT,                   -- JSON string (array)
+  metadata TEXT                       -- JSON string (album, buttons, quote, ...)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
   USING fts5(body, content='messages', content_rowid='id');
+
+-- Sinkronisasi messages_fts otomatis (external content table, lihat
+-- https://sqlite.org/fts5.html#external_content_tables). Trigger dipasang di
+-- sini (bukan di hostd) supaya siapa pun yang menulis ke messages langsung
+-- lewat SQL tetap menjaga index tetap konsisten.
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.id, old.body);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.id, old.body);
+  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+END;
 
 CREATE TABLE IF NOT EXISTS bus_queue (
   id TEXT PRIMARY KEY,                -- envelope id (idempotency key)
