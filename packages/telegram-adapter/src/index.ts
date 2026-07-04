@@ -1,2 +1,6 @@
-// @mirza-harness/telegram-adapter — skeleton; diisi pada fase berikutnya (design doc §9).
-export const PKG = "telegram-adapter";
+// @mirza-harness/telegram-adapter — pure telegram modules (Task C1, Fase 1).
+export * from "./album-buffer";
+export * from "./buttons";
+export * from "./markdown";
+export * from "./paginated-picker";
+export * from "./chunk";
