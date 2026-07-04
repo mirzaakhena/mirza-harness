@@ -7,3 +7,7 @@ export * from "./chunk";
 // Task C3, Fase 1 — poller lifecycle grammy supervised.
 export * from "./poller";
 export * from "./gate";
+// Task C4, Fase 1 — inbound pipeline gate->media/album/callback->store->bus.
+export * from "./inbound";
+// Task C5, Fase 1 — outbound sender (reply/react/download_attachment/get_message_by_id).
+export * from "./outbound";
