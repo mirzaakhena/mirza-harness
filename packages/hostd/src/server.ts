@@ -1,12 +1,52 @@
 import net from "node:net";
-import { RpcRequest, parseRpcMessage } from "@mirza-harness/shared";
+import { z } from "zod";
+import { RpcRequest, type RpcEventT, parseRpcMessage } from "@mirza-harness/shared";
 import { doctorReport } from "./doctor";
 
-type Handler = (params: unknown) => unknown;
+type Handler = (params: unknown, sock: net.Socket) => unknown;
+
+/**
+ * Registry koneksi cc-stub: bot_id -> socket IPC yang mendaftar via
+ * `session.register`. Modul-scoped karena hostd berjalan sebagai satu proses
+ * daemon per pipe; satu bot_id hanya boleh punya satu koneksi aktif pada satu
+ * waktu (registrasi baru menimpa yang lama).
+ */
+const connections = new Map<string, net.Socket>();
+
+const SessionRegisterParams = z.object({ bot_id: z.string().min(1) }).strict();
 
 const handlers: Record<string, Handler> = {
   doctor: () => doctorReport(),
+  "session.register": (params, sock) => {
+    const { bot_id } = SessionRegisterParams.parse(params);
+    connections.set(bot_id, sock);
+    sock.once("close", () => {
+      // Hanya hapus bila socket ini masih pemegang mapping (bisa saja sudah
+      // ditimpa oleh registrasi bot_id yang sama dari koneksi baru).
+      if (connections.get(bot_id) === sock) connections.delete(bot_id);
+    });
+    return { registered: true, bot_id };
+  },
 };
+
+/** Apakah bot_id punya koneksi cc-stub terdaftar saat ini. */
+export function isRegistered(botId: string): boolean {
+  return connections.has(botId);
+}
+
+/**
+ * Kirim event JSON-RPC (notification, tanpa id) `method`/`params` ke koneksi
+ * cc-stub terdaftar untuk `botId`. Return `false` (tanpa melempar) bila tak
+ * ada koneksi terdaftar atau write ke socket gagal — pemanggil (delivery.ts)
+ * bertanggung jawab menangani ini sbg kegagalan terlihat (fail + retry),
+ * bukan drop senyap atau ack envelope yang gagal terkirim (SCAR-056).
+ */
+export function pushEvent(botId: string, method: string, params: unknown): boolean {
+  const sock = connections.get(botId);
+  if (!sock) return false;
+  const event: RpcEventT = { jsonrpc: "2.0", method, params };
+  return sock.write(JSON.stringify(event) + "\n");
+}
 
 function respond(sock: net.Socket, obj: object): void {
   sock.write(JSON.stringify(obj) + "\n");
@@ -27,7 +67,7 @@ function handleLine(sock: net.Socket, line: string): void {
       respond(sock, { jsonrpc: "2.0", id, error: { code: -32601, message: `method tak dikenal: ${req.data.method}` } });
       return;
     }
-    respond(sock, { jsonrpc: "2.0", id, result: handler(req.data.params) });
+    respond(sock, { jsonrpc: "2.0", id, result: handler(req.data.params, sock) });
   } catch (e) {
     // Prinsip §2.5: kegagalan harus terlihat — balas error, jangan telan.
     respond(sock, { jsonrpc: "2.0", id, error: { code: -32700, message: String(e) } });
