@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import net from "node:net";
-import { startServer, pushEvent, isRegistered, registerConfirmHandler } from "../src/server";
+import { startServer, pushEvent, isRegistered, registerConfirmHandler, registerRpcHandlerDeps } from "../src/server";
+import { openDb } from "../src/state/db";
+import type { RpcHandlerDeps } from "../src/rpc-handlers";
 
 const TEST_PIPE = `\\\\.\\pipe\\mirza-hostd-test-${process.pid}`;
 
@@ -174,5 +176,60 @@ describe("channel.confirm — delegasi ke delivery", () => {
     registerConfirmHandler(() => ({ confirmed: true }));
     const res = await rpcCall(CONFIRM_PIPE, { jsonrpc: "2.0", id: 4, method: "channel.confirm", params: { envelope_id: "env-1" } });
     expect(res.error).toBeDefined();
+  });
+});
+
+describe("Task D2 — telegram.outbound/agent.list/agent.status/agent.send delegasi ke rpc-handlers", () => {
+  const RPC_PIPE = `\\\\.\\pipe\\mirza-hostd-test-rpc-${process.pid}`;
+  let server: net.Server;
+  afterAll(() => {
+    server?.close();
+    registerRpcHandlerDeps(null); // jangan bocor ke test file lain di proses yang sama
+  });
+
+  test("tanpa deps ter-wiring → semua 4 method menjawab error terlihat, bukan diam-diam sukses/kosong", async () => {
+    server = await startServer(RPC_PIPE);
+    for (const method of ["telegram.outbound", "agent.list", "agent.status", "agent.send"]) {
+      const res = await rpcCall(RPC_PIPE, { jsonrpc: "2.0", id: 1, method, params: {} });
+      expect(res.error).toBeDefined();
+    }
+  });
+
+  test("dgn deps ter-wiring → agent.list mengembalikan hasil handleAgentList nyata", async () => {
+    const deps: RpcHandlerDeps = {
+      db: openDb(":memory:"),
+      config: { bots: [{ id: "bot-01", telegram_token: "1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", workspace: "C:/ws/bot-01" }] },
+      telegramSenders: new Map(),
+      adapterStatuses: new Map([["bot-01", { state: "running" as const }]]),
+      isRegistered: () => true,
+    };
+    registerRpcHandlerDeps(deps);
+
+    const res = await rpcCall(RPC_PIPE, { jsonrpc: "2.0", id: 2, method: "agent.list", params: {} });
+
+    expect(res.result).toEqual([{ name: "bot-01", workspace: "C:/ws/bot-01", poller_status: "running", stub_connected: true }]);
+  });
+
+  test("agent.send lewat pipe: enqueue nyata, doctor.bus.queued mencerminkannya", async () => {
+    const deps: RpcHandlerDeps = {
+      db: openDb(":memory:"),
+      config: { bots: [{ id: "bot-01", telegram_token: "1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", workspace: "C:/ws/bot-01" }] },
+      telegramSenders: new Map(),
+      adapterStatuses: new Map(),
+      isRegistered: () => false,
+    };
+    registerRpcHandlerDeps(deps);
+
+    const sendRes = await rpcCall(RPC_PIPE, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "agent.send",
+      params: { from: "bot-02", target: "bot-01", payload: { kind: "prompt", body: "halo" } },
+    });
+    expect(sendRes.result).toEqual([{ target: "bot-01", queued: true }]);
+
+    const doctorRes = await rpcCall(RPC_PIPE, { jsonrpc: "2.0", id: 4, method: "doctor" });
+    const busStats = JSON.parse(doctorRes.result.components.bus);
+    expect(busStats.queued).toBe(1);
   });
 });

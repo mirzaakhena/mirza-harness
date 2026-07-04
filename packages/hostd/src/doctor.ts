@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { busStats } from "./bus/bus";
+import type { DeliveryStats } from "./bus/delivery";
 
 export const HOSTD_VERSION = "0.0.1";
 
@@ -12,9 +13,26 @@ export interface DoctorReport {
   components: Record<string, string>;
 }
 
+/** Structural subset of telegram-adapter's `PollerStatus` actually needed here — avoids a hard type import for a single field. */
+export interface DoctorPollerStatusLike {
+  state: string;
+}
+
 export interface DoctorDeps {
   /** Bila ada, komponen `bus` dilaporkan dari busStats(db) alih-alih "stub". */
   db?: Database;
+  /**
+   * Task D2, Fase 1 — bila ada, komponen `adapters` dilaporkan sbg
+   * `{botId: pollerState}` (dari `startTelegramAdapters(...).statuses`)
+   * alih-alih "stub".
+   */
+  adapterStatuses?: ReadonlyMap<string, DoctorPollerStatusLike>;
+  /**
+   * Task D2, Fase 1 — bila ada (BERSAMA `db`), digabung ke dalam komponen
+   * `bus` sbg field `delivery` (dari `startDelivery`'s tick stats). Tidak
+   * berpengaruh tanpa `db` (komponen bus tetap "stub").
+   */
+  deliveryStats?: DeliveryStats;
 }
 
 /**
@@ -35,7 +53,15 @@ export function doctorReport(deps: DoctorDeps = {}): DoctorReport {
   if (deps.db) {
     const stats = busStats(deps.db);
     const clamped = { ...stats, oldest_unacked_s: Math.max(0, stats.oldest_unacked_s) };
-    busComponent = JSON.stringify(clamped);
+    const merged = deps.deliveryStats ? { ...clamped, delivery: deps.deliveryStats } : clamped;
+    busComponent = JSON.stringify(merged);
+  }
+
+  let adaptersComponent = "stub";
+  if (deps.adapterStatuses) {
+    const byBot: Record<string, string> = {};
+    for (const [botId, status] of deps.adapterStatuses) byBot[botId] = status.state;
+    adaptersComponent = JSON.stringify(byBot);
   }
 
   return {
@@ -44,6 +70,6 @@ export function doctorReport(deps: DoctorDeps = {}): DoctorReport {
     pid: process.pid,
     uptime_s: Math.floor(process.uptime()),
     db: deps.db ? "connected" : "not-connected (menyusul fase 1)",
-    components: { bus: busComponent, state: "stub", adapters: "stub", supervisors: "stub" },
+    components: { bus: busComponent, state: "stub", adapters: adaptersComponent, supervisors: "stub" },
   };
 }

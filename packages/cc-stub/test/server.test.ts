@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { makeChannelDeliverHandler, makeEventRouter, type McpNotifier } from "../src/server";
+import { makeChannelDeliverHandler, makeEventRouter, registerToolHandlers, type McpNotifier, type McpToolRegistrar } from "../src/server";
 
 function mockMcp(): { mcp: McpNotifier; notifications: { method: string; params?: unknown }[] } {
   const notifications: { method: string; params?: unknown }[] = [];
@@ -122,5 +122,43 @@ describe("makeEventRouter", () => {
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(notifications.length).toBe(1);
     expect(confirmed).toEqual(["e2"]);
+  });
+});
+
+describe("registerToolHandlers", () => {
+  function fakeRegistrar(): { mcp: McpToolRegistrar; handlers: Map<unknown, (req: unknown) => Promise<unknown>> } {
+    const handlers = new Map<unknown, (req: unknown) => Promise<unknown>>();
+    return {
+      mcp: {
+        setRequestHandler: (schema, handler) => {
+          handlers.set(schema, handler as (req: unknown) => Promise<unknown>);
+        },
+      },
+      handlers,
+    };
+  }
+
+  test("registers tools/list -> 7 tool defs, and tools/call -> proxies via deps.call", async () => {
+    const { mcp, handlers } = fakeRegistrar();
+    const calls: { method: string; params: unknown }[] = [];
+    registerToolHandlers(mcp, {
+      botId: "bot-03",
+      call: async (method, params) => {
+        calls.push({ method, params });
+        return "ok";
+      },
+    });
+
+    expect(handlers.size).toBe(2);
+    const [listSchema, callSchema] = [...handlers.keys()];
+
+    const listResult = (await handlers.get(listSchema)!({})) as { tools: { name: string }[] };
+    expect(listResult.tools.length).toBe(7);
+
+    const callResult = (await handlers.get(callSchema)!({ params: { name: "agent_list", arguments: {} } })) as {
+      content: { type: string; text: string }[];
+    };
+    expect(calls).toEqual([{ method: "agent.list", params: undefined }]);
+    expect(callResult.content[0]!.text).toBe("ok");
   });
 });

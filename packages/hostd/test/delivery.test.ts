@@ -366,4 +366,19 @@ describe("startDelivery — loop interval", () => {
     expect(pushed.length).toBeGreaterThanOrEqual(1);
     db.close();
   });
+
+  test("stats() akumulasi delivered/failed lintas tick (Task D2 — wiring doctor)", async () => {
+    const db = openDb(":memory:");
+    enqueue(db, env());
+    enqueue(db, env());
+    const { deps } = fakeDeps();
+
+    const handle = startDelivery(db, deps, { intervalMs: 15 });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    handle.stop();
+
+    expect(handle.stats().delivered).toBeGreaterThanOrEqual(2);
+    expect(handle.stats().failed).toBe(0);
+    db.close();
+  });
 });

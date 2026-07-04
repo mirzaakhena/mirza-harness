@@ -53,3 +53,28 @@ describe("doctorReport (deps.db — wiring bus stats)", () => {
     db.close();
   });
 });
+
+describe("doctorReport (Task D2 — adapterStatuses + deliveryStats wiring)", () => {
+  test("adapterStatuses -> komponen adapters berisi {botId: pollerState}, bukan 'stub'", () => {
+    const r = doctorReport({ adapterStatuses: new Map([["bot-01", { state: "running" }], ["bot-02", { state: "degraded" }]]) });
+    expect(JSON.parse(r.components.adapters)).toEqual({ "bot-01": "running", "bot-02": "degraded" });
+  });
+
+  test("deliveryStats tanpa db -> tidak berpengaruh, bus tetap 'stub'", () => {
+    const r = doctorReport({ deliveryStats: { delivered: 5, failed: 1 } });
+    expect(r.components.bus).toBe("stub");
+  });
+
+  test("deliveryStats BERSAMA db -> digabung ke dalam komponen bus sbg field delivery", () => {
+    const db = openDb(":memory:");
+    const r = doctorReport({ db, deliveryStats: { delivered: 5, failed: 1 } });
+    const stats = JSON.parse(r.components.bus);
+    expect(stats.delivery).toEqual({ delivered: 5, failed: 1 });
+    db.close();
+  });
+
+  test("tanpa deps sama sekali, adapters tetap 'stub' (backward-compat)", () => {
+    const r = doctorReport();
+    expect(r.components.adapters).toBe("stub");
+  });
+});

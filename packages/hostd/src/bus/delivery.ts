@@ -248,15 +248,28 @@ export function deliverOnce(db: Database, deps: DeliveryDeps, opts: DeliveryOpti
 
 export interface DeliveryHandle {
   stop(): void;
+  /**
+   * Task D2, Fase 1 — statistik KUMULATIF (delivered/failed) sejak
+   * `startDelivery` dipanggil, dijumlahkan lintas semua tick. Dipakai wiring
+   * `doctorReport` (main.ts) supaya komponen `bus` di laporan doctor
+   * mencerminkan aktivitas delivery nyata, bukan sekadar `busStats()` snapshot
+   * per-titik-waktu.
+   */
+  stats(): DeliveryStats;
 }
 
 /** Mulai loop delivery berkala (default 500ms). Panggil `.stop()` utk berhenti. */
 export function startDelivery(db: Database, deps: DeliveryDeps, opts: DeliveryOptions = {}): DeliveryHandle {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
-  const timer = setInterval(() => deliverOnce(db, deps, opts), intervalMs);
+  const cumulative: DeliveryStats = { delivered: 0, failed: 0 };
+  const timer = setInterval(() => {
+    const tick = deliverOnce(db, deps, opts);
+    cumulative.delivered += tick.delivered;
+    cumulative.failed += tick.failed;
+  }, intervalMs);
   // Jangan tahan proses hidup hanya krn timer ini (relevan utk test/CLI singkat).
   if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
     (timer as unknown as { unref: () => void }).unref();
   }
-  return { stop: () => clearInterval(timer) };
+  return { stop: () => clearInterval(timer), stats: () => ({ ...cumulative }) };
 }
