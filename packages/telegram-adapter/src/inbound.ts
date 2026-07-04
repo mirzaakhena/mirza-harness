@@ -3,6 +3,14 @@ import { Envelope, type Access, type EnvelopeT } from "@mirza-harness/shared";
 import { gate, type ChatType, type GateResult } from "./gate";
 import { parseAiCallbackData } from "./buttons";
 import { createAlbumBuffer } from "./album-buffer";
+import {
+  tryRouteMetaCommand,
+  tryHandleMetaCallback,
+  type MetaCommandBot,
+  type SessionOpsClient,
+  type MetaCommandResult,
+  type MetaCallbackEffect,
+} from "./meta-commands";
 
 /**
  * Task C4, Fase 1 — inbound pipeline: gate (C2) -> media/album/quote/callback
@@ -38,16 +46,24 @@ import { createAlbumBuffer } from "./album-buffer";
  *   code). Calling access-store's `addPending` again for a resend would
  *   overwrite the existing pending entry (createdAt/expiresAt/replies all
  *   reset) and undermine the reply-cap check in `gate.ts`'s `pairingFlow`.
- * - Meta-commands/permission-replies are NOT intercepted (fase 2). Only
- *   `isMetaCommand` is computed (via `isKnownMetaCommand`, mirroring the
- *   known-command list in `meta-commands.ts`) so SEC-2 gating in `gate()`
- *   still applies to strangers typing `/new` etc. When such a message
- *   *does* deliver (private + allowFrom), `meta.note =
- *   'meta-command-unhandled-fase1'` is stamped so the AI (and future
- *   debugging) knows this text was a recognized meta-command that fase 1
- *   passed through unhandled, rather than silently treating it as prose.
- *   `isPermissionReply` is never computed in fase 1 (always false) — that
- *   whole flow is fase 2 scope.
+ * - Meta-commands (Task M1, Fase 2) ARE now intercepted BEFORE delivery to
+ *   the AI, via the optional `metaCommands` dependency (`{ bot, client }`,
+ *   `client: SessionOpsClient` from `./meta-commands.ts`, itself a thin
+ *   router over hostd's session-ops supervisor API — see that module's doc
+ *   for the full recon-meta.md mapping). `isMetaCommand` (computed via
+ *   `isKnownMetaCommand`) still gates through SEC-2 in `gate()` first — a
+ *   meta-command only ever reaches `tryRouteMetaCommand`/
+ *   `tryHandleMetaCallback` when `chatType==='private' && sender in
+ *   allowFrom`; the meta: callback path passes `isMetaCommand:true` into
+ *   `gate()` for the same reason (a crafted `meta:*` callback_data must not
+ *   slip through group/mention rules). When `metaCommands` is NOT supplied
+ *   (older/partial wiring — hostd's `main.ts` doesn't pass it yet as of
+ *   Fase 2 M1; that's a separate wiring task) the pipeline falls back to
+ *   the Fase-1 behavior: a recognized meta-command text still delivers to
+ *   the AI with `meta.note = 'meta-command-unhandled-fase1'` stamped, and a
+ *   `meta:*` callback is dropped outright (out of scope without a client).
+ *   `isPermissionReply` is never computed here (always false) — that whole
+ *   flow remains out of scope.
  * - `isInfoCommand` (SEC-1 in gate.ts — /start /help /context /version are
  *   DM-only) IS computed before every `gate()` call, via `isKnownInfoCommand`
  *   mirroring the four `bot.command(...)` handlers gated by `dmCommandGate`
@@ -134,7 +150,15 @@ export type InboundOutcome =
   | { type: "dropped"; reason: string }
   | { type: "delivered" }
   | ({ type: "pairing-reply" } & PairingReplyResult)
-  | { type: "buffered" };
+  | { type: "buffered" }
+  | { type: "meta-command"; result: MetaCommandResult }
+  | { type: "meta-callback"; effects: MetaCallbackEffect[] };
+
+/** Task M1 (Fase 2) dependency — routes intercepted meta-commands/callbacks to hostd's session-ops supervisor. */
+export interface MetaCommandsConfig {
+  bot: MetaCommandBot;
+  client: SessionOpsClient;
+}
 
 export interface CreateInboundPipelineOptions {
   botId: string;
@@ -152,6 +176,17 @@ export interface CreateInboundPipelineOptions {
   onPairingReply?: (chatId: string, result: PairingReplyResult) => void;
   /** Observe the outcome of an album flush (no caller promise exists to resolve into for that async path). */
   onAlbumOutcome?: (chatId: string, outcome: InboundOutcome) => void;
+  /**
+   * Task M1 (Fase 2) — when supplied, a recognized meta-command (`/new`,
+   * `/switch`, `/delete[...]`, `/rename`, `/effort`) or a `meta:*` callback
+   * is intercepted BEFORE delivery to the AI: routed through
+   * `tryRouteMetaCommand`/`tryHandleMetaCallback` (./meta-commands.ts)
+   * against this `client`, and the resulting `MetaCommandResult`/
+   * `MetaCallbackEffect[]` is returned as the outcome for the caller to
+   * send (this pipeline never sends Telegram messages itself). When
+   * omitted, falls back to the Fase-1 behavior (see module doc).
+   */
+  metaCommands?: MetaCommandsConfig;
 }
 
 interface ResolvedDeps {
@@ -164,6 +199,7 @@ interface ResolvedDeps {
   onPending: (userId: string, code: string) => void;
   onPairingReply: (chatId: string, result: PairingReplyResult) => void;
   onAlbumOutcome: (chatId: string, outcome: InboundOutcome) => void;
+  metaCommands?: MetaCommandsConfig;
 }
 
 function warn(stage: string, err: unknown): void {
@@ -268,6 +304,23 @@ async function handleSingle(msg: InboundMessage, deps: ResolvedDeps): Promise<In
   }
 
   const ts = msg.ts ?? deps.now();
+
+  if (isMetaCommand && deps.metaCommands) {
+    const result = await tryRouteMetaCommand(msg.text ?? "", deps.metaCommands.bot, deps.metaCommands.client);
+    if (result) {
+      deps.store.logInbound({
+        ts,
+        chat_id: msg.chatId,
+        message_id: msg.messageId,
+        user_id: msg.senderId,
+        user_name: msg.senderName ?? msg.senderId,
+        body: msg.text,
+        metadata: { meta_command: true },
+      });
+      return { type: "meta-command", result };
+    }
+  }
+
   const imagePath = msg.photo ? await safeDownload(msg.photo.fileId, deps) : undefined;
 
   const content = msg.text ?? (msg.photo ? "(photo)" : msg.document ? `(document: ${msg.document.name ?? "file"})` : "");
@@ -337,6 +390,60 @@ function finishPairingReply(
 // Callback (ai:* button tap) path.
 // ---------------------------------------------------------------------------
 
+/**
+ * meta:* callback branch (Task M1, Fase 2). Split out of `handleCallback`
+ * so the ai:* path below stays untouched. `isMetaCommand:true` is passed
+ * into `gate()` here (SEC-2) so a crafted `meta:*` callback_data can never
+ * slip through group/mention rules the way a plain ai:* button tap can —
+ * meta: callbacks require chatType==='private' && sender in allowFrom, full
+ * stop, exactly like meta-command TEXT does in `handleSingle`.
+ */
+async function handleMetaCallback(
+  callback: InboundCallback,
+  msg: InboundMessage,
+  deps: ResolvedDeps,
+): Promise<InboundOutcome> {
+  const gateResult = gate(
+    {
+      chatType: msg.chatType,
+      chatId: msg.chatId,
+      senderId: msg.senderId,
+      isInfoCommand: isKnownInfoCommand(msg.text),
+      isMetaCommand: true,
+    },
+    deps.access(),
+    { now: deps.now() },
+  );
+
+  if (gateResult.action === "drop") {
+    return { type: "dropped", reason: gateResult.reason };
+  }
+  if (gateResult.action === "pairing-reply") {
+    return finishPairingReply(gateResult, msg.senderId, msg.chatId, deps);
+  }
+
+  if (!deps.metaCommands) {
+    return { type: "dropped", reason: "meta callback but no SessionOps client wired" };
+  }
+
+  const effects = await tryHandleMetaCallback(callback.data, deps.metaCommands.bot, deps.metaCommands.client);
+  if (!effects) {
+    return { type: "dropped", reason: "not a meta callback" };
+  }
+
+  const ts = msg.ts ?? deps.now();
+  deps.store.logInbound({
+    ts,
+    chat_id: msg.chatId,
+    message_id: msg.messageId,
+    user_id: msg.senderId,
+    user_name: msg.senderName ?? msg.senderId,
+    body: `[meta callback: ${callback.data}]`,
+    metadata: { meta_callback: true },
+  });
+  return { type: "meta-callback", effects };
+}
+
 async function handleCallback(msg: InboundMessage, deps: ResolvedDeps): Promise<InboundOutcome> {
   const callback = msg.callback;
   if (!callback) {
@@ -344,8 +451,13 @@ async function handleCallback(msg: InboundMessage, deps: ResolvedDeps): Promise<
     return { type: "dropped", reason: "missing callback payload" };
   }
 
-  // perm:*/meta:* callbacks are handled by other (future) consumers — this
-  // pipeline only speaks the ai:* namespace (buttons.ts, C1).
+  if (callback.data.startsWith("meta:")) {
+    return handleMetaCallback(callback, msg, deps);
+  }
+
+  // perm:* callbacks are handled by other (future) consumers — this
+  // pipeline only speaks the ai:* namespace (buttons.ts, C1) plus meta:*
+  // (handled above).
   const aiParsed = parseAiCallbackData(callback.data);
   if (!aiParsed) {
     return { type: "dropped", reason: "callback not in ai:* namespace (out of Fase-1 scope)" };
@@ -552,6 +664,7 @@ export function createInboundPipeline(options: CreateInboundPipelineOptions): In
     onPending: options.onPending ?? (() => {}),
     onPairingReply: options.onPairingReply ?? (() => {}),
     onAlbumOutcome: options.onAlbumOutcome ?? (() => {}),
+    metaCommands: options.metaCommands,
   };
 
   const albumBuffer = createAlbumBuffer<InboundMessage>({

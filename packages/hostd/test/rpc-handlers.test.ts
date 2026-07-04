@@ -8,6 +8,7 @@ import {
   handleAgentStatus,
   handleAgentSend,
   handleSessionStarted,
+  handleTelemetryReport,
   type RpcHandlerDeps,
 } from "../src/rpc-handlers";
 import type { OutboundSender } from "@mirza-harness/telegram-adapter";
@@ -99,7 +100,59 @@ describe("handleAgentStatus", () => {
       1000,
     ]);
     const result = handleAgentStatus({ name: "bot-01" }, deps);
-    expect(result.session).toEqual({ id: "sess-1", name: "my-session", lifecycle: "idle", started_at: 1000, ended_at: null });
+    expect(result.session).toEqual({
+      id: "sess-1",
+      name: "my-session",
+      lifecycle: "idle",
+      started_at: 1000,
+      ended_at: null,
+      used_percentage: null,
+      context_window_size: null,
+      model: null,
+      effort: null,
+      cost: null,
+      captured_at_ms: null,
+    });
+  });
+
+  test("telemetry columns populated by telemetry.report are surfaced (INFRA-5: same row agent.status reads)", () => {
+    const deps = baseDeps();
+    deps.db.run(`INSERT INTO bots (id, workspace) VALUES (?, ?)`, ["bot-01", "C:/workspace/bot-01"]);
+    deps.db.run(`INSERT INTO sessions (id, bot_id, name, lifecycle, started_at) VALUES (?, ?, ?, ?, ?)`, [
+      "sess-1",
+      "bot-01",
+      "my-session",
+      "idle",
+      1000,
+    ]);
+    handleTelemetryReport(
+      {
+        bot_id: "bot-01",
+        session_id: "sess-1",
+        used_percentage: 42.5,
+        context_window_size: 200000,
+        model: "claude-sonnet-5",
+        effort: "high",
+        cost: 1.23,
+        captured_at_ms: 1720000000000,
+      },
+      deps,
+    );
+
+    const result = handleAgentStatus({ name: "bot-01" }, deps);
+    expect(result.session).toEqual({
+      id: "sess-1",
+      name: "my-session",
+      lifecycle: "idle",
+      started_at: 1000,
+      ended_at: null,
+      used_percentage: 42.5,
+      context_window_size: 200000,
+      model: "claude-sonnet-5",
+      effort: "high",
+      cost: 1.23,
+      captured_at_ms: 1720000000000,
+    });
   });
 
   test("unknown bot name -> clear error listing known bots", () => {
@@ -276,5 +329,98 @@ describe("handleSessionStarted", () => {
   test("bad params shape (missing session_id) -> zod error, nothing written", () => {
     const deps = baseDeps();
     expect(() => handleSessionStarted({ bot_id: "bot-01", source: "startup", cwd: "C:/workspace/bot-01" }, deps)).toThrow();
+  });
+});
+
+describe("handleTelemetryReport", () => {
+  function seedSession(deps: RpcHandlerDeps, botId: string, sessionId: string): void {
+    deps.db.run(`INSERT INTO bots (id, workspace) VALUES (?, ?)`, [botId, `C:/workspace/${botId}`]);
+    deps.db.run(`INSERT INTO sessions (id, bot_id, name, lifecycle, started_at) VALUES (?, ?, 'idle', 'idle', ?)`, [
+      sessionId,
+      botId,
+      1000,
+    ]);
+  }
+
+  test("existing session row -> telemetry columns updated, updated:true", () => {
+    const deps = baseDeps();
+    seedSession(deps, "bot-01", "sess-1");
+
+    const result = handleTelemetryReport(
+      {
+        bot_id: "bot-01",
+        session_id: "sess-1",
+        used_percentage: 55,
+        context_window_size: 180000,
+        model: "claude-opus",
+        effort: "medium",
+        cost: 0.42,
+        captured_at_ms: 1700000000000,
+      },
+      deps,
+    );
+
+    expect(result).toEqual({ updated: true });
+    const row = deps.db
+      .query(`SELECT used_percentage, context_window_size, model, effort, cost, captured_at_ms FROM sessions WHERE id = ?`)
+      .get("sess-1");
+    expect(row).toEqual({
+      used_percentage: 55,
+      context_window_size: 180000,
+      model: "claude-opus",
+      effort: "medium",
+      cost: 0.42,
+      captured_at_ms: 1700000000000,
+    });
+  });
+
+  test("fields omitted/null -> written as NULL, not 0/empty-string (FUNC-1 nullable contract)", () => {
+    const deps = baseDeps();
+    seedSession(deps, "bot-01", "sess-1");
+
+    const result = handleTelemetryReport({ bot_id: "bot-01", session_id: "sess-1" }, deps);
+
+    expect(result).toEqual({ updated: true });
+    const row = deps.db
+      .query(`SELECT used_percentage, context_window_size, model, effort, cost, captured_at_ms FROM sessions WHERE id = ?`)
+      .get("sess-1");
+    expect(row).toEqual({
+      used_percentage: null,
+      context_window_size: null,
+      model: null,
+      effort: null,
+      cost: null,
+      captured_at_ms: null,
+    });
+  });
+
+  test("no matching (bot_id, session_id) row -> updated:false, does not throw (honest no-op, not faked success)", () => {
+    const deps = baseDeps();
+    const result = handleTelemetryReport({ bot_id: "bot-01", session_id: "sess-does-not-exist" }, deps);
+    expect(result).toEqual({ updated: false });
+  });
+
+  test("session_id matches a DIFFERENT bot_id's row -> not updated (bot_id is part of the match, not just a label)", () => {
+    const deps = baseDeps();
+    seedSession(deps, "bot-01", "sess-1");
+    const result = handleTelemetryReport({ bot_id: "bot-02", session_id: "sess-1" }, deps);
+    expect(result).toEqual({ updated: false });
+    const row = deps.db.query(`SELECT used_percentage FROM sessions WHERE id = ?`).get("sess-1") as { used_percentage: number | null };
+    expect(row.used_percentage).toBeNull();
+  });
+
+  test("bad params shape (missing session_id) -> zod error, nothing written", () => {
+    const deps = baseDeps();
+    expect(() => handleTelemetryReport({ bot_id: "bot-01" }, deps)).toThrow();
+  });
+
+  test("bad params shape (missing bot_id) -> zod error", () => {
+    const deps = baseDeps();
+    expect(() => handleTelemetryReport({ session_id: "sess-1" }, deps)).toThrow();
+  });
+
+  test("unexpected extra field -> zod .strict() rejects", () => {
+    const deps = baseDeps();
+    expect(() => handleTelemetryReport({ bot_id: "bot-01", session_id: "sess-1", unexpected: true }, deps)).toThrow();
   });
 });

@@ -19,7 +19,22 @@ CREATE TABLE IF NOT EXISTS sessions (
   name TEXT NOT NULL DEFAULT 'idle',
   lifecycle TEXT NOT NULL DEFAULT 'idle',  -- idle|busy|resetting|dead
   started_at INTEGER NOT NULL,
-  ended_at INTEGER
+  ended_at INTEGER,
+  -- Task M2, Fase 2 -- kolom telemetri statusline (recon-hooks.md paragraf E),
+  -- diisi oleh RPC telemetry.report (cc-stub's scripts/context-bridge.ts,
+  -- dipicu CC statusLine). SEMUA nullable: belum ada snapshot statusLine
+  -- (belum pernah "fire") = NULL, bukan 0/"" -- FUNC-1 fix (/context dan
+  -- agent_status harus bisa membedakan "belum ada data" dari "nilai nol
+  -- asli"). Ditambah di sini untuk DB baru; migrateSessionsTelemetryColumns
+  -- di bawah menambahkannya via ALTER TABLE untuk DB lama yang sudah ada
+  -- baris sessions sebelum kolom ini ada (CREATE TABLE IF NOT EXISTS tidak
+  -- menyentuh tabel yang sudah tercipta).
+  used_percentage REAL,
+  context_window_size INTEGER,
+  model TEXT,
+  effort TEXT,
+  cost REAL,
+  captured_at_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -125,6 +140,38 @@ CREATE TABLE IF NOT EXISTS session_archive (
 );
 `;
 
+/**
+ * Task M2, Fase 2 — additive migration for `sessions`' telemetry columns
+ * (see the CREATE TABLE comment above). `CREATE TABLE IF NOT EXISTS` only
+ * helps brand-new databases; a DB file created before this task exists
+ * already has a `sessions` table WITHOUT these columns, and that statement
+ * is then a no-op. This walks `PRAGMA table_info` and `ALTER TABLE ... ADD
+ * COLUMN`s in whichever are missing — idempotent (checks presence first),
+ * additive only (never touches an existing column), and safe to call on
+ * every `applySchema` (including `:memory:` test DBs, where the CREATE
+ * TABLE above already included them and this loop is simply a no-op).
+ */
+const SESSION_TELEMETRY_COLUMNS: ReadonlyArray<{ name: string; ddlType: string }> = [
+  { name: "used_percentage", ddlType: "REAL" },
+  { name: "context_window_size", ddlType: "INTEGER" },
+  { name: "model", ddlType: "TEXT" },
+  { name: "effort", ddlType: "TEXT" },
+  { name: "cost", ddlType: "REAL" },
+  { name: "captured_at_ms", ddlType: "INTEGER" },
+];
+
+function migrateSessionsTelemetryColumns(db: Database): void {
+  const existing = new Set(
+    (db.query(`PRAGMA table_info(sessions)`).all() as { name: string }[]).map(row => row.name),
+  );
+  for (const col of SESSION_TELEMETRY_COLUMNS) {
+    if (!existing.has(col.name)) {
+      db.exec(`ALTER TABLE sessions ADD COLUMN ${col.name} ${col.ddlType}`);
+    }
+  }
+}
+
 export function applySchema(db: Database): void {
   db.exec(SCHEMA_SQL);
+  migrateSessionsTelemetryColumns(db);
 }

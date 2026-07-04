@@ -8,6 +8,7 @@ import {
   handleAgentStatus,
   handleAgentSend,
   handleSessionStarted,
+  handleTelemetryReport,
   type RpcHandlerDeps,
 } from "./rpc-handlers";
 
@@ -100,6 +101,8 @@ const handlers: Record<string, Handler> = {
   "agent.send": params => handleAgentSend(params, requireRpcDeps()),
   // Task H1, Fase 2 — cc-stub's SessionStart hook (`packages/cc-stub/hooks/session-start.ts`).
   "session.started": params => handleSessionStarted(params, requireRpcDeps()),
+  // Task M2, Fase 2 — cc-stub's statusLine bridge (`packages/cc-stub/scripts/context-bridge.ts`).
+  "telemetry.report": params => handleTelemetryReport(params, requireRpcDeps()),
 };
 
 /** Apakah bot_id punya koneksi cc-stub terdaftar saat ini. */

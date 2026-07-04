@@ -277,8 +277,8 @@ describe("inbound pipeline — ai:* callback tap", () => {
   });
 });
 
-describe("inbound pipeline — meta-command flag (fase 1 stub)", () => {
-  test("known meta command from allowFrom sender delivers with meta.note stamped", async () => {
+describe("inbound pipeline — meta-command flag (no SessionOps client wired)", () => {
+  test("known meta command from allowFrom sender delivers with meta.note stamped when metaCommands option is absent", async () => {
     const { store, calls } = makeStore();
     const { enqueueEnv, envs } = makeEnqueue();
     const access: Access = { ...defaultAccess(), dmPolicy: "pairing", allowFrom: ["u1"] };
@@ -299,6 +299,148 @@ describe("inbound pipeline — meta-command flag (fase 1 stub)", () => {
     expect(payload.content).toBe("/new some-session");
     expect(payload.meta.note).toBe("meta-command-unhandled-fase1");
     expect(allMetaValuesAreStrings(payload.meta)).toBe(true);
+  });
+
+  test("meta: callback with no metaCommands wired is dropped gracefully (no throw)", async () => {
+    const { store, calls } = makeStore();
+    const { enqueueEnv, envs } = makeEnqueue();
+    const access: Access = { ...defaultAccess(), dmPolicy: "pairing", allowFrom: ["u1"] };
+
+    const handle = createInboundPipeline({
+      botId: "bot-01",
+      access: () => access,
+      store,
+      enqueueEnv,
+      now: () => NOW,
+    });
+
+    const outcome = await handle(baseMsg({ text: undefined, callback: { data: "meta:switch_deadbeef" } }));
+
+    expect(outcome.type).toBe("dropped");
+    expect(calls.length).toBe(0);
+    expect(envs.length).toBe(0);
+  });
+});
+
+describe("inbound pipeline — meta-command interception (Fase 2, M1)", () => {
+  function makeFakeSessionOps() {
+    const calls: { method: string; args: unknown[] }[] = [];
+    const client = {
+      async listSessions() { calls.push({ method: "listSessions", args: [] }); return []; },
+      async currentSession() { calls.push({ method: "currentSession", args: [] }); return null; },
+      async isAlive() { calls.push({ method: "isAlive", args: [] }); return true; },
+      async resume(_bot: unknown, sessionId: string) { calls.push({ method: "resume", args: [sessionId] }); return { ok: true as const }; },
+      async rename(_bot: unknown, name: string) { calls.push({ method: "rename", args: [name] }); return { ok: true as const, from: "idle", to: name }; },
+      async clearSession(_bot: unknown, opts?: { name?: string }) { calls.push({ method: "clearSession", args: [opts] }); return { ok: true as const, nameApplied: opts?.name !== undefined }; },
+      async setEffort(_bot: unknown, level: string) { calls.push({ method: "setEffort", args: [level] }); return { ok: true as const }; },
+      async archiveSession(_bot: unknown, sessionId: string) { calls.push({ method: "archiveSession", args: [sessionId] }); return { ok: true as const }; },
+      async hardDelete(_bot: unknown, sessionId: string) { calls.push({ method: "hardDelete", args: [sessionId] }); return { ok: true as const }; },
+      async bulkArchive() { calls.push({ method: "bulkArchive", args: [] }); return { processed: 0, skipped: 0, errors: 0 }; },
+      async bulkDelete() { calls.push({ method: "bulkDelete", args: [] }); return { processed: 0, skipped: 0, errors: 0 }; },
+    };
+    return { client, calls };
+  }
+
+  test("/new intercepted BEFORE delivering to AI: SessionOps called, nothing enqueued, outcome carries the meta-command result", async () => {
+    const { store, calls } = makeStore();
+    const { enqueueEnv, envs } = makeEnqueue();
+    const access: Access = { ...defaultAccess(), dmPolicy: "pairing", allowFrom: ["u1"] };
+    const { client, calls: opsCalls } = makeFakeSessionOps();
+
+    const handle = createInboundPipeline({
+      botId: "bot-01",
+      access: () => access,
+      store,
+      enqueueEnv,
+      now: () => NOW,
+      metaCommands: { bot: { id: "bot-01", workspace: "/proj" }, client },
+    });
+
+    const outcome = await handle(baseMsg({ text: "/new discuss-mcp" }));
+
+    expect(outcome.type).toBe("meta-command");
+    expect(envs.length).toBe(0); // NOT forwarded to AI
+    expect(calls.length).toBe(1); // still logged for audit trail
+    expect(opsCalls.some(c => c.method === "clearSession" && (c.args[0] as { name?: string })?.name === "discuss-mcp")).toBe(true);
+    if (outcome.type === "meta-command") {
+      expect(outcome.result.type).toBe("meta-executed");
+    }
+  });
+
+  test("meta: callback tap intercepted: gated by SEC-2 (private+allowFrom), calls SessionOps, returns meta-callback effects", async () => {
+    const { store, calls } = makeStore();
+    const { enqueueEnv, envs } = makeEnqueue();
+    const access: Access = { ...defaultAccess(), dmPolicy: "pairing", allowFrom: ["u1"] };
+    const { client, calls: opsCalls } = makeFakeSessionOps();
+
+    const handle = createInboundPipeline({
+      botId: "bot-01",
+      access: () => access,
+      store,
+      enqueueEnv,
+      now: () => NOW,
+      metaCommands: { bot: { id: "bot-01", workspace: "/proj" }, client },
+    });
+
+    const outcome = await handle(baseMsg({ text: undefined, callback: { data: "meta:effort_high" } }));
+
+    expect(outcome.type).toBe("meta-callback");
+    expect(envs.length).toBe(0);
+    expect(calls.length).toBe(1);
+    expect(opsCalls.some(c => c.method === "setEffort" && c.args[0] === "high")).toBe(true);
+  });
+
+  test("SEC-2: meta: callback from a group (even with mention rules satisfied) is dropped — meta callbacks require private+allowFrom", async () => {
+    const { store, calls } = makeStore();
+    const { enqueueEnv, envs } = makeEnqueue();
+    const access: Access = {
+      ...defaultAccess(),
+      groups: { g1: { requireMention: false, allowFrom: ["u1"] } },
+    };
+    const { client, calls: opsCalls } = makeFakeSessionOps();
+
+    const handle = createInboundPipeline({
+      botId: "bot-01",
+      access: () => access,
+      store,
+      enqueueEnv,
+      now: () => NOW,
+      metaCommands: { bot: { id: "bot-01", workspace: "/proj" }, client },
+    });
+
+    const outcome = await handle(
+      baseMsg({ chatType: "group", chatId: "g1", senderId: "u1", text: undefined, callback: { data: "meta:effort_high" } }),
+    );
+
+    expect(outcome.type).toBe("dropped");
+    expect(calls.length).toBe(0);
+    expect(envs.length).toBe(0);
+    expect(opsCalls.length).toBe(0);
+  });
+
+  test("stranger (not in allowFrom) sending a meta-command text is dropped by SEC-2, never reaches SessionOps", async () => {
+    const { store, calls } = makeStore();
+    const { enqueueEnv, envs } = makeEnqueue();
+    const access: Access = { ...defaultAccess(), dmPolicy: "pairing" };
+    const { client, calls: opsCalls } = makeFakeSessionOps();
+
+    const handle = createInboundPipeline({
+      botId: "bot-01",
+      access: () => access,
+      store,
+      enqueueEnv,
+      now: () => NOW,
+      metaCommands: { bot: { id: "bot-01", workspace: "/proj" }, client },
+    });
+
+    const outcome = await handle(baseMsg({ senderId: "stranger-1", chatId: "stranger-1", text: "/new x" }));
+
+    // SEC-2 (gate.ts): meta-commands from a sender NOT in allowFrom are
+    // dropped outright, never routed to the pairing flow.
+    expect(outcome.type).toBe("dropped");
+    expect(opsCalls.length).toBe(0);
+    expect(calls.length).toBe(0);
+    expect(envs.length).toBe(0);
   });
 });
 

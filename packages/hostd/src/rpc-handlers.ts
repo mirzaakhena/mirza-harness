@@ -131,6 +131,21 @@ export interface AgentStatusSessionRow {
   lifecycle: string;
   started_at: number;
   ended_at: number | null;
+  /**
+   * Task M2, Fase 2 — telemetry columns (schema.ts), written by cc-stub's
+   * `scripts/context-bridge.ts` via the `telemetry.report` RPC below. NULL
+   * until the first CC statusLine snapshot fires for this session (FUNC-1:
+   * "no data yet" is a real, distinguishable state — never faked as 0/"").
+   * `context-command.ts` (telegram-adapter) reads this SAME query result
+   * (via `agent.status`) to render `/context` — INFRA-5: one row, one
+   * writer, both readers agree by construction.
+   */
+  used_percentage: number | null;
+  context_window_size: number | null;
+  model: string | null;
+  effort: string | null;
+  cost: number | null;
+  captured_at_ms: number | null;
 }
 
 export interface AgentStatusResult {
@@ -158,7 +173,8 @@ export function handleAgentStatus(params: unknown, deps: RpcHandlerDeps): AgentS
 
   const session = deps.db
     .query(
-      `SELECT id, name, lifecycle, started_at, ended_at
+      `SELECT id, name, lifecycle, started_at, ended_at,
+              used_percentage, context_window_size, model, effort, cost, captured_at_ms
          FROM sessions
         WHERE bot_id = ?
         ORDER BY started_at DESC
@@ -313,4 +329,73 @@ export function handleSessionStarted(params: unknown, deps: RpcHandlerDeps): Ses
   const name = row?.name ?? "idle";
 
   return { additionalContext: `Current session name: "${name}"` };
+}
+
+// ---------------------------------------------------------------------------
+// telemetry.report {bot_id, session_id, used_percentage, context_window_size,
+// model, effort, cost, captured_at_ms} — Task M2, Fase 2.
+//
+// Called (best-effort) by cc-stub's `scripts/context-bridge.ts` on every CC
+// statusLine invocation. Updates the telemetry columns (schema.ts's Task M2
+// additions) of the ALREADY-EXISTING `sessions` row for (bot_id, session_id)
+// — that row is written by `handleSessionStarted` above when the session's
+// SessionStart hook fires, which always happens before its first statusLine
+// snapshot, so in the normal case the row is already there.
+//
+// Every field besides bot_id/session_id is nullable (accepts `null` or
+// omission) — cc-stub's `parseStatusLineInput` (context-bridge.ts) may not
+// find every field in a given CC snapshot; whatever it DID find still gets
+// written, whatever it didn't stays/becomes NULL (matches the columns'
+// nullable contract, FUNC-1).
+//
+// Does NOT throw when no matching row exists yet (race: statusLine fires
+// before SessionStart's RPC lands, or the session already ended) — this is
+// a best-effort telemetry write, not a business-rule validation; the honest
+// `{updated: false}` return lets a caller notice without treating it as a
+// wire-level error. `bot_id` is validated but NOT cross-checked against
+// hostd config (unlike `agent.status`'s `name`) — a stale/renamed bot_id
+// here simply fails to match any row (`updated: false`), which is the
+// correct "nothing to update" outcome, not a config lookup failure.
+// ---------------------------------------------------------------------------
+
+const TelemetryReportParams = z
+  .object({
+    bot_id: z.string().min(1),
+    session_id: z.string().min(1),
+    used_percentage: z.number().nullable().optional(),
+    context_window_size: z.number().nullable().optional(),
+    model: z.string().nullable().optional(),
+    effort: z.string().nullable().optional(),
+    cost: z.number().nullable().optional(),
+    captured_at_ms: z.number().nullable().optional(),
+  })
+  .strict();
+
+export type TelemetryReportParamsT = z.infer<typeof TelemetryReportParams>;
+
+export interface TelemetryReportResult {
+  /** `true` iff a `sessions` row for (bot_id, session_id) existed and was updated. */
+  updated: boolean;
+}
+
+export function handleTelemetryReport(params: unknown, deps: RpcHandlerDeps): TelemetryReportResult {
+  const parsed = TelemetryReportParams.parse(params);
+
+  const result = deps.db.run(
+    `UPDATE sessions
+        SET used_percentage = ?, context_window_size = ?, model = ?, effort = ?, cost = ?, captured_at_ms = ?
+      WHERE id = ? AND bot_id = ?`,
+    [
+      parsed.used_percentage ?? null,
+      parsed.context_window_size ?? null,
+      parsed.model ?? null,
+      parsed.effort ?? null,
+      parsed.cost ?? null,
+      parsed.captured_at_ms ?? null,
+      parsed.session_id,
+      parsed.bot_id,
+    ],
+  );
+
+  return { updated: result.changes > 0 };
 }

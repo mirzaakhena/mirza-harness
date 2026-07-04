@@ -11,3 +11,7 @@ export * from "./gate";
 export * from "./inbound";
 // Task C5, Fase 1 — outbound sender (reply/react/download_attachment/get_message_by_id).
 export * from "./outbound";
+// Task M1, Fase 2 — meta-command router (/new /switch /rename /delete /effort) over session-ops.
+export * from "./meta-commands";
+// Task M2, Fase 2 — /context + /version reply rendering (telemetry from sessions, INFRA-5/FUNC-1/VER-1).
+export * from "./context-command";
