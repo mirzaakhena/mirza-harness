@@ -6,6 +6,7 @@
   "exports": { ".": "./src/index.ts" },
   "dependencies": {
     "@mirza-harness/shared": "workspace:*",
+    "@mirza-harness/telegram-adapter": "workspace:*",
     "zod": "^3.23.0"
   }
 }

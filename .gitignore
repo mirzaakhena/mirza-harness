@@ -4,3 +4,4 @@ node_modules/
 *.db-shm
 dist/
 .superpowers/
+hostd.config.json

@@ -1,0 +1,9 @@
+{
+  "bots": [
+    {
+      "id": "bot-03",
+      "telegram_token": "123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "workspace": "C:/Users/Mirza/workspace/bot-03"
+    }
+  ]
+}
