@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["bun"],
+    "paths": { "@mirza-harness/*": ["./packages/*/src"] }
+  },
+  "include": ["packages/*/src", "packages/*/test"]
+}
