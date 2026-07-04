@@ -123,6 +123,104 @@ describe("startHostd — smoke", () => {
     expect((env!.payload as { content: string }).content).toBe("halo dari smoke test");
   });
 
+  test("E1-1: an authorized ai:* callback tap is acked without a text (clears the Telegram spinner)", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-cb-ok-${process.pid}`;
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      createPoller: fakeCreatePoller(captured),
+    });
+
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: ["999"] }, "telegram");
+
+    const answerCalls: unknown[] = [];
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "tester" },
+      callbackQuery: {
+        data: "ai:yes",
+        message: { message_id: 1, date: Math.floor(Date.now() / 1000), reply_markup: { inline_keyboard: [] } },
+      },
+      answerCallbackQuery: async (arg?: unknown) => {
+        answerCalls.push(arg);
+      },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    expect(answerCalls).toEqual([undefined]);
+
+    const env = claimNext(handle.db, "bot-smoke");
+    expect(env).not.toBeNull();
+  });
+
+  test("E1-1: an unauthorized ai:* callback tap is acked with 'Not authorized.'", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-cb-unauth-${process.pid}`;
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      createPoller: fakeCreatePoller(captured),
+    });
+
+    // Sender NOT in allowFrom + dmPolicy 'allowlist' (default) -> gate() drops.
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: [], dmPolicy: "allowlist" }, "telegram");
+
+    const answerCalls: unknown[] = [];
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "stranger" },
+      callbackQuery: {
+        data: "ai:yes",
+        message: { message_id: 1, date: Math.floor(Date.now() / 1000), reply_markup: { inline_keyboard: [] } },
+      },
+      answerCallbackQuery: async (arg?: unknown) => {
+        answerCalls.push(arg);
+      },
+    } as unknown as Context;
+
+    await captured.onInbound!(fakeCtx);
+
+    expect(answerCalls).toEqual([{ text: "Not authorized." }]);
+  });
+
+  test("E1-1: answerCallbackQuery throwing (expired callback query) never crashes the pipeline", async () => {
+    const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
+    const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-cb-expired-${process.pid}`;
+
+    handle = await startHostd({
+      config: makeFakeConfig(),
+      dbPath: ":memory:",
+      pipeName: pipe,
+      createPoller: fakeCreatePoller(captured),
+    });
+
+    setAccess(handle.db, "bot-smoke", { ...defaultAccess(), allowFrom: ["999"] }, "telegram");
+
+    const fakeCtx = {
+      chat: { id: 999, type: "private" },
+      from: { id: 999, username: "tester" },
+      callbackQuery: {
+        data: "ai:yes",
+        message: { message_id: 1, date: Math.floor(Date.now() / 1000), reply_markup: { inline_keyboard: [] } },
+      },
+      answerCallbackQuery: async () => {
+        throw new Error("400: query is too old and response timeout expired");
+      },
+    } as unknown as Context;
+
+    // Must resolve, not reject/throw.
+    await expect(captured.onInbound!(fakeCtx)).resolves.toBeUndefined();
+
+    const env = claimNext(handle.db, "bot-smoke");
+    expect(env).not.toBeNull();
+  });
+
   test("shutdown() is idempotent and actually stops the poller + closes the pipe", async () => {
     const captured: { onInbound?: (ctx: Context) => void | Promise<void> } = {};
     const pipe = `\\\\.\\pipe\\mirza-hostd-test-main-shutdown-${process.pid}`;

@@ -1,9 +1,9 @@
 import { join } from "node:path";
 import type net from "node:net";
 import type { Database } from "bun:sqlite";
-import { Api } from "grammy";
+import { Api, type Context } from "grammy";
 import { PIPE_NAME_DEFAULT } from "@mirza-harness/shared";
-import { createInboundPipeline, createOutboundSender, type OutboundApi, type OutboundSender } from "@mirza-harness/telegram-adapter";
+import { createInboundPipeline, createOutboundSender, type InboundOutcome, type OutboundApi, type OutboundSender } from "@mirza-harness/telegram-adapter";
 import { HOSTD_VERSION } from "./doctor";
 import { loadConfig, type BotConfig, type HostdConfig } from "./config";
 import { openDb } from "./state/db";
@@ -89,6 +89,33 @@ function toOutboundApi(api: Api): OutboundApi {
       api.setMessageReaction(chat_id, message_id, reaction as Parameters<Api["setMessageReaction"]>[2]),
     getFile: file_id => api.getFile(file_id),
   };
+}
+
+/**
+ * Fix E1-1: kode acuan (`plugins/telegram/server.ts:1277,1338,1381,1403,1409`)
+ * calls `ctx.answerCallbackQuery(...)` for EVERY callback_query branch —
+ * authorized (empty/plain ack) and unauthorized (`{text:'Not authorized.'}`)
+ * alike — always `.catch(()=>{})`'d because a callback query expires ~15s
+ * after Telegram sends it and answering a stale one throws. Fase-1 wiring
+ * (`onInbound` below) called the pure `createInboundPipeline` but never
+ * acked, so the button in the Telegram app spun forever even though the tap
+ * reached the pipeline correctly.
+ *
+ * This stays in main.ts (wiring), not telegram-adapter's pipeline: the
+ * pipeline is deliberately grammy-free (inbound.ts's module doc — "never a
+ * grammy `Context`... this pipeline's" job stops at data), and it already
+ * returns the `InboundOutcome` the ack decision needs (nothing new to plumb
+ * through) — only the caller holds the live grammy `ctx` required to answer.
+ */
+async function ackCallback(ctx: Context, outcome: InboundOutcome): Promise<void> {
+  const text = outcome.type === "delivered" ? undefined : "Not authorized.";
+  try {
+    await ctx.answerCallbackQuery(text ? { text } : undefined);
+  } catch (err) {
+    // Expected: callback queries expire ~15s after Telegram sends them.
+    // Never let an expired-query error crash the inbound pipeline.
+    process.stderr.write(`hostd: answerCallbackQuery gagal (kemungkinan callback query kadaluwarsa): ${err}\n`);
+  }
 }
 
 function botStateDir(bot: BotConfig): string {
@@ -194,7 +221,10 @@ export async function startHostd(opts: StartHostdOptions = {}): Promise<HostdHan
       if (!msg) return;
       const pipeline = pipelines.get(botId);
       if (!pipeline) return; // Defensive — every configured bot has a pipeline; unreachable in practice.
-      await pipeline(msg);
+      const outcome = await pipeline(msg);
+      // Fix E1-1: a button tap MUST be acked or the Telegram app's spinner on
+      // that button never stops — see ackCallback's docstring above.
+      if (msg.callback) await ackCallback(ctx, outcome);
     },
     ...(opts.createPoller ? { createPoller: opts.createPoller } : {}),
   });
